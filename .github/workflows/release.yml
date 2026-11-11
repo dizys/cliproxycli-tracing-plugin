@@ -55,7 +55,9 @@ jobs:
             os: ubuntu-24.04
           - target: linux/arm64
             dir: linux_arm64
-            os: ubuntu-24.04
+            # Native arm64 runner: no cross toolchain to install, so the build
+            # has no dependency on apt at all.
+            os: ubuntu-24.04-arm
           - target: windows/amd64
             dir: windows_amd64
             os: windows-2025
@@ -70,12 +72,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install cross compiler (linux/arm64)
-        if: matrix.target == 'linux/arm64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu zip
-
+      # linux/arm64 builds on a native arm64 runner, so no cross compiler is
+      # installed. This deliberately removes any apt dependency from the build:
+      # a shared runner that stalls on apt-get leaves the job with no output and
+      # no way to tell a slow mirror from a hang.
       - name: Install cross compiler (windows/amd64)
         if: matrix.target == 'windows/amd64'
         shell: pwsh
