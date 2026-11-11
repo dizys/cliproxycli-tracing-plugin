@@ -1,0 +1,7 @@
+dist/
+stage/
+*.h
+*.dll
+*.so
+*.dylib
+/cliproxycli-tracing-plugin

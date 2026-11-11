@@ -1,0 +1,159 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "build-release.sh"
+      - ".github/workflows/release.yml"
+  # Builds and verifies the full asset matrix without publishing, so the
+  # platform toolchains can be checked before a tag is cut.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # A tag run derives the version from the tag; a pull_request or manual run has
+  # no usable version, so it falls back to 0.0.0-dev, which still exercises the
+  # whole matrix without pretending to be a release.
+  RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.0.0-dev' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+  # One library per platform, each built on a native runner. A c-shared library
+  # cannot be cross-compiled to Darwin without a macOS SDK, and the store
+  # requires all five platforms, so the matrix is the only honest way to
+  # produce them. Each job uploads one library; the package job assembles them.
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin/amd64
+            dir: darwin_amd64
+            os: macos-15-intel
+          - target: darwin/arm64
+            dir: darwin_arm64
+            os: macos-15
+          - target: linux/amd64
+            dir: linux_amd64
+            os: ubuntu-24.04
+          - target: linux/arm64
+            dir: linux_arm64
+            os: ubuntu-24.04
+          - target: windows/amd64
+            dir: windows_amd64
+            os: windows-2025
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install cross compiler (linux/arm64)
+        if: matrix.target == 'linux/arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu zip
+
+      - name: Install cross compiler (windows/amd64)
+        if: matrix.target == 'windows/amd64'
+        shell: pwsh
+        run: |
+          # The runner ships MSYS2 but not on PATH; its mingw64 gcc targets
+          # windows/amd64 and is what cgo needs for a c-shared build.
+          C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc zip"
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build library
+        run: VERSION="${RELEASE_VERSION#v}" TARGET="${{ matrix.target }}" ./build-release.sh
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.dir }}
+          path: dist/lib/${{ matrix.dir }}/*
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Each artifact is downloaded into its own platform directory, which is
+      # exactly the dist/lib/<goos>_<goarch>/ layout the packaging step expects.
+      - name: Download libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lib-*
+          path: dist/lib-tmp
+
+      - name: Arrange library layout
+        run: |
+          set -euo pipefail
+          mkdir -p dist/lib
+          for dir in dist/lib-tmp/lib-*; do
+            platform="${dir#dist/lib-tmp/lib-}"
+            mkdir -p "dist/lib/${platform}"
+            cp "${dir}"/* "dist/lib/${platform}/"
+          done
+          rm -rf dist/lib-tmp
+          find dist/lib -type f | sort
+
+      - name: Package
+        run: VERSION="${RELEASE_VERSION#v}" ./build-release.sh --package
+
+      - name: Verify asset matrix
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION#v}"
+          for platform in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64 windows_amd64; do
+            name="cliproxy-tracing_${version}_${platform}.zip"
+            test -f "dist/${name}" || { echo "missing dist/${name}"; exit 1; }
+            grep -q "  ${name}$" dist/checksums.txt || { echo "missing checksum for ${name}"; exit 1; }
+            count="$(unzip -Z1 "dist/${name}" | wc -l)"
+            test "${count}" -eq 1 || { echo "${name} holds ${count} entries, want 1"; exit 1; }
+            # The store documents the archive entry as <id>.<ext>.
+            ext="so"
+            case "${platform}" in darwin_*) ext="dylib" ;; windows_*) ext="dll" ;; esac
+            entry="$(unzip -Z1 "dist/${name}")"
+            test "${entry}" = "cliproxy-tracing.${ext}" || {
+              echo "${name} holds ${entry}, want cliproxy-tracing.${ext}"; exit 1; }
+          done
+          echo "asset matrix complete"
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.zip dist/checksums.txt
