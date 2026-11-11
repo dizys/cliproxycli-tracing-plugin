@@ -64,7 +64,17 @@ func extractDeltaText(body []byte) string {
 func openAIDeltaText(raw json.RawMessage) string {
 	var choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   json.RawMessage `json:"content"`
+			Text      string          `json:"text"`
+			ToolCalls []struct {
+				Index    *int   `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 		Text string `json:"text"`
 	}
@@ -73,24 +83,59 @@ func openAIDeltaText(raw json.RawMessage) string {
 	}
 	var b strings.Builder
 	for i := range choices {
-		if choices[i].Delta.Content != "" {
-			b.WriteString(choices[i].Delta.Content)
-		} else if choices[i].Text != "" {
+		c := &choices[i]
+		if len(c.Delta.Content) > 0 {
+			b.WriteString(rawContentText(c.Delta.Content))
+		} else if c.Delta.Text != "" {
 			// Legacy completions stream text directly.
-			b.WriteString(choices[i].Text)
+			b.WriteString(c.Delta.Text)
+		} else if c.Text != "" {
+			b.WriteString(c.Text)
+		}
+		// Tool calls stream as a name on the first delta and argument
+		// fragments after it. They are not assistant text, so they are marked
+		// with a tag rather than concatenated into the answer.
+		for _, tc := range c.Delta.ToolCalls {
+			if tc.Function.Name != "" {
+				b.WriteString("[tool_use] " + tc.Function.Name + " ")
+			}
+			if tc.Function.Arguments != "" {
+				b.WriteString(tc.Function.Arguments)
+			}
 		}
 	}
 	return b.String()
 }
 
+// anthropicDeltaText handles the Anthropic stream event shapes. Beyond plain
+// text deltas, an agent stream carries tool_use blocks (the model's arguments)
+// and thinking blocks, both of which are part of the conversation.
 func anthropicDeltaText(raw json.RawMessage) string {
-	var delta struct {
-		Text string `json:"text"`
-	}
+	var delta map[string]json.RawMessage
 	if json.Unmarshal(raw, &delta) != nil {
 		return ""
 	}
-	return delta.Text
+	var b strings.Builder
+
+	var text string
+	if json.Unmarshal(delta["text"], &text) == nil && text != "" {
+		b.WriteString(text)
+	}
+	// input_json_delta carries tool arguments, one fragment at a time.
+	if raw, ok := delta["partial_json"]; ok {
+		var frag string
+		if json.Unmarshal(raw, &frag) == nil {
+			b.WriteString(frag)
+		}
+	}
+	// thinking_delta carries reasoning text.
+	if raw, ok := delta["thinking"]; ok {
+		var think string
+		if json.Unmarshal(raw, &think) == nil && think != "" {
+			b.WriteString(think)
+		}
+	}
+	return b.String()
 }
 
 func geminiDeltaText(raw json.RawMessage) string {
@@ -123,11 +168,20 @@ func extractCompletionText(body []byte) string {
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return ""
 	}
-	// OpenAI chat/completions: choices[].message.content
+	// OpenAI chat/completions: choices[].message, which may carry tool_calls
+	// instead of, or alongside, content.
 	if raw, ok := doc["choices"]; ok {
 		var choices []struct {
 			Message struct {
-				Content json.RawMessage `json:"content"`
+				Content   json.RawMessage `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"message"`
 			Text string `json:"text"`
 		}
@@ -139,26 +193,22 @@ func extractCompletionText(body []byte) string {
 				} else if c.Text != "" {
 					b.WriteString(c.Text)
 				}
+				for _, tc := range c.Message.ToolCalls {
+					if tc.Function.Name != "" {
+						b.WriteString("[tool_use] " + tc.Function.Name + " ")
+					}
+					b.WriteString(tc.Function.Arguments)
+				}
 			}
 			if b.Len() > 0 {
 				return b.String()
 			}
 		}
 	}
-	// Anthropic messages: content[].text
+	// Anthropic messages: content[] may hold text, tool_use, thinking blocks.
 	if raw, ok := doc["content"]; ok {
-		var parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if json.Unmarshal(raw, &parts) == nil {
-			var b strings.Builder
-			for _, p := range parts {
-				b.WriteString(p.Text)
-			}
-			if b.Len() > 0 {
-				return b.String()
-			}
+		if text := rawContentText(raw); text != "" {
+			return text
 		}
 	}
 	// Gemini: candidates[].content.parts[].text
@@ -186,24 +236,34 @@ func extractCompletionText(body []byte) string {
 }
 
 // rawContentText handles a message content field that may be a string or an
-// array of typed parts.
+// array of typed parts, keeping tool calls and other non-text payloads.
 func rawContentText(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
 		return s
 	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
 	}
-	if json.Unmarshal(raw, &parts) == nil {
-		var b strings.Builder
-		for _, p := range parts {
-			b.WriteString(p.Text)
+	var b strings.Builder
+	for i, part := range parts {
+		if i > 0 {
+			b.WriteString("\n")
 		}
-		return b.String()
+		var asString string
+		if json.Unmarshal(part, &asString) == nil {
+			b.WriteString(asString)
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(part, &m) == nil {
+			b.WriteString(partToString(m))
+			continue
+		}
+		b.WriteString(string(part))
 	}
-	return ""
+	return b.String()
 }
 
 // trimSSEFraming strips the "data: " prefix and blank-line framing the proxy

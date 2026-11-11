@@ -287,6 +287,87 @@ func TestConfigHeadersRejectControlChars(t *testing.T) {
 	}
 }
 
+// An agent transcript is mostly tool traffic. A tool_use carries the arguments
+// the model emitted and a tool_result carries what the tool returned; both were
+// previously replaced with a bare [tool_use] label, losing the payload.
+func TestToolCallPayloadsArePreserved(t *testing.T) {
+	body := `{"messages":[
+      {"role":"assistant","content":[
+        {"type":"text","text":"Let me look."},
+        {"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"/etc/hosts","limit":50}}
+      ]},
+      {"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"toolu_1","content":"127.0.0.1 localhost"}
+      ]},
+      {"role":"assistant","content":[
+        {"type":"thinking","thinking":"The file lists loopback."}
+      ]}
+    ]}`
+	msgs := parsePromptMessages([]byte(body))
+	all := ""
+	for _, m := range msgs {
+		all += m.Content + "\n"
+	}
+
+	for _, want := range []string{"/etc/hosts", "read_file", "127.0.0.1 localhost", "The file lists loopback"} {
+		if !strings.Contains(all, want) {
+			t.Fatalf("tool payload %q was dropped; got:\n%s", want, all)
+		}
+	}
+	if strings.Contains(all, "[tool_use]\n") || strings.TrimSpace(all) == "[tool_use]" {
+		t.Fatal("tool_use was replaced with a bare label")
+	}
+}
+
+// Streamed tool calls arrive as name-then-argument-fragments with no text.
+func TestStreamedToolCallFragmentsArePreserved(t *testing.T) {
+	nameChunk := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`
+	argChunk := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}]}`
+
+	if got := extractDeltaText([]byte(nameChunk)); !strings.Contains(got, "get_weather") {
+		t.Fatalf("tool name dropped: %q", got)
+	}
+	if got := extractDeltaText([]byte(argChunk)); !strings.Contains(got, "Paris") {
+		t.Fatalf("tool arguments dropped: %q", got)
+	}
+}
+
+// Anthropic streams tool input and thinking as their own delta types.
+func TestAnthropicToolAndThinkingDeltas(t *testing.T) {
+	inputChunk := `data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}`
+	thinkingChunk := `data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}`
+
+	if got := extractDeltaText([]byte(inputChunk)); !strings.Contains(got, `"q":"x"`) {
+		t.Fatalf("tool input dropped: %q", got)
+	}
+	if got := extractDeltaText([]byte(thinkingChunk)); !strings.Contains(got, "hmm") {
+		t.Fatalf("thinking dropped: %q", got)
+	}
+}
+
+// Non-streaming responses carry tool_calls on the message, not in content.
+func TestNonStreamingToolCallsArePreserved(t *testing.T) {
+	body := `{"choices":[{"message":{"content":null,"tool_calls":[
+      {"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\":\"hedgehogs\"}"}}
+    ]}}]}`
+	got := extractCompletionText([]byte(body))
+	if !strings.Contains(got, "search") || !strings.Contains(got, "hedgehogs") {
+		t.Fatalf("non-streaming tool call dropped: %q", got)
+	}
+}
+
+func TestPlainTextStillClean(t *testing.T) {
+	msgs := parsePromptMessages([]byte(`{"messages":[{"role":"user","content":"just text"}]}`))
+	if len(msgs) != 1 || msgs[0].Content != "just text" {
+		t.Fatalf("plain text was mangled: %#v", msgs)
+	}
+	// A text part must not gain a [text] prefix.
+	parts := parsePromptMessages([]byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
+	if parts[0].Content != "hi" {
+		t.Fatalf("text part = %q, want it verbatim", parts[0].Content)
+	}
+}
+
 func TestConfigFieldsAreDeclared(t *testing.T) {
 	keys := map[string]bool{}
 	for _, f := range configFields() {

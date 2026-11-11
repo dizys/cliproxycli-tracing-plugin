@@ -112,6 +112,13 @@ completions are **not** redacted: what the caller sent is what is exported, so a
 credential pasted into a prompt leaves the machine with it. Scrub before export
 if that matters for your deployment.
 
+Every part of an agent conversation is kept, not just assistant prose. A
+`tool_use` block keeps its tool name and arguments, a `tool_result` keeps the
+tool's output, and `thinking` blocks keep their text, on both the streaming and
+non-streaming paths and for both tool-call dialects. Streamed tool arguments
+arrive as fragments and are joined in order. Plain text parts are exported as
+their text alone, with no type prefix.
+
 Three limits apply. Content above `max_content_chars` per message is truncated
 with a marker. Bodies above 4 MiB and completions above 2 MiB are truncated at
 capture time, and the span records that it happened. `require_complete` drops
@@ -143,7 +150,7 @@ reported to the host log.
 Requires Go 1.24+ and a C compiler (cgo).
 
 ```sh
-./build.sh                     # -> cliproxy-tracing-v0.1.1.so (linux/amd64)
+./build.sh                     # -> cliproxy-tracing-v0.1.2.so (linux/amd64)
 ARCH=arm64 ./build.sh          # native arm64 build
 ./build-release.sh             # plugin-store artifacts in dist/
 ```

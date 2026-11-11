@@ -32,7 +32,7 @@ const (
 )
 
 // pluginVersion is overridden at build time with -X main.pluginVersion=<version>.
-var pluginVersion = "0.1.1"
+var pluginVersion = "0.1.2"
 
 var plugin = newPluginInstance()
 

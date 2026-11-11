@@ -21,7 +21,7 @@
 #   ./build-release.sh --package          package the libraries already built
 #
 # Environment:
-#   VERSION   release version without the leading v (default: 0.1.1)
+#   VERSION   release version without the leading v (default: 0.1.2)
 #   OUT_DIR   output directory (default: dist)
 #   CC_<goos>_<goarch>   override the compiler for one platform, for example
 #                        CC_linux_arm64=aarch64-linux-gnu-gcc
@@ -30,7 +30,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PLUGIN_ID="cliproxy-tracing"
-VERSION="${VERSION:-0.1.1}"
+VERSION="${VERSION:-0.1.2}"
 VERSION="${VERSION#v}"
 OUT_DIR="${OUT_DIR:-dist}"
 LIB_DIR="${OUT_DIR}/lib"

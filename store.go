@@ -391,9 +391,12 @@ func parsePromptMessages(body []byte) []chatMessage {
 	return out
 }
 
-// contentToString flattens a message content field. Providers allow either a
-// string or an array of typed parts (text, image_url, tool_use...), so the
-// array form is folded into readable text and non-text parts are labelled.
+// contentToString flattens a message content field into text. Providers allow
+// either a string or an array of typed parts, and an agent transcript is
+// mostly the typed ones: tool_use carries the arguments the model emitted,
+// tool_result carries what the tool returned, and thinking carries reasoning.
+// All three are preserved verbatim as JSON rather than replaced with a label,
+// because they are the substance of an agent conversation.
 func contentToString(v any) string {
 	switch typed := v.(type) {
 	case nil:
@@ -403,28 +406,10 @@ func contentToString(v any) string {
 	case []any:
 		out := make([]byte, 0, 256)
 		for i, part := range typed {
-			if m, ok := part.(map[string]any); ok {
-				typ := stringField(m, "type")
-				if text := stringField(m, "text"); text != "" {
-					if i > 0 {
-						out = append(out, '\n')
-					}
-					out = append(out, text...)
-					continue
-				}
-				if typ != "" {
-					if i > 0 {
-						out = append(out, '\n')
-					}
-					out = append(out, '[')
-					out = append(out, typ...)
-					out = append(out, ']')
-				}
-				continue
+			if i > 0 {
+				out = append(out, '\n')
 			}
-			if s, ok := part.(string); ok {
-				out = append(out, s...)
-			}
+			out = append(out, partToString(part)...)
 		}
 		return string(out)
 	default:
@@ -434,6 +419,48 @@ func contentToString(v any) string {
 		}
 		return ""
 	}
+}
+
+// partToString renders one content part, keeping its payload. A text part is
+// its text; anything else keeps every field except the redundant type, which
+// is re-emitted as a prefix so the shape is still readable line by line.
+func partToString(part any) string {
+	if s, ok := part.(string); ok {
+		return s
+	}
+	m, ok := part.(map[string]any)
+	if !ok {
+		if raw, err := json.Marshal(part); err == nil {
+			return string(raw)
+		}
+		return ""
+	}
+
+	typ := stringField(m, "type")
+
+	// A plain text part: keep the text alone.
+	if text, ok := m["text"].(string); ok && typ == "text" {
+		return text
+	}
+
+	// Everything else keeps its structure. The type is dropped from the body
+	// because it is already the prefix, and any text field is folded back in
+	// so nothing is lost.
+	payload := make(map[string]any, len(m))
+	for k, v := range m {
+		if k == "type" {
+			continue
+		}
+		payload[k] = v
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil || len(raw) == 0 {
+		return "[" + typ + "]"
+	}
+	if typ == "" {
+		return string(raw)
+	}
+	return "[" + typ + "] " + string(raw)
 }
 
 func stringField(doc map[string]any, key string) string {
