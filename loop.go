@@ -141,12 +141,19 @@ func (p *pluginInstance) shutdown() {
 		return
 	}
 	p.stopped = true
+	retired := p.looper.stop
 	p.mu.Unlock()
 
+	// The host calls shutdown during its preflight probe, before any register,
+	// so the loop may never have started and both channels are nil. Closing a
+	// nil channel panics, which is fatal inside dlopen.
+	if retired == nil {
+		return
+	}
 	select {
-	case <-p.looper.stop:
+	case <-retired:
 	default:
-		close(p.looper.stop)
+		close(retired)
 	}
 	select {
 	case <-p.looper.done:

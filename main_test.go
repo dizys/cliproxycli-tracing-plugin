@@ -299,6 +299,53 @@ func TestConfigFieldsAreDeclared(t *testing.T) {
 	}
 }
 
+// The host calls plugin.shutdown during its dlopen preflight, before any
+// register, so the loop never started and its channels are nil. Closing a nil
+// channel panics, and a panic inside dlopen makes the plugin fail to load.
+func TestShutdownBeforeRegisterIsSafe(t *testing.T) {
+	resetPlugin(t)
+	// No startLoop: simulate the preflight probe.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("shutdown panicked before register: %v", r)
+		}
+	}()
+	plugin.shutdown()
+	// A second shutdown from the real unload must also be safe.
+	plugin.shutdown()
+}
+
+// The same preflight calls quiesce before any config exists.
+func TestQuiesceBeforeRegisterIsSafe(t *testing.T) {
+	resetPlugin(t)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("quiesce panicked before register: %v", r)
+		}
+	}()
+	if _, err := handleMethod(methodPluginQuiesce, nil); err != nil {
+		t.Fatalf("quiesce: %v", err)
+	}
+}
+
+// Register then shutdown is the normal unload path and must not hang.
+func TestShutdownAfterRegisterCompletes(t *testing.T) {
+	resetPlugin(t)
+	if _, err := handleMethod(methodPluginRegister, []byte(`{"schema_version":6}`)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		plugin.shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown after register did not complete")
+	}
+}
+
 // --- helpers --------------------------------------------------------------
 
 func attrKeys(list []otlpKeyValue) map[string]string {

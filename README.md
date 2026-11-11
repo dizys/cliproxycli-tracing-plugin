@@ -143,7 +143,7 @@ reported to the host log.
 Requires Go 1.24+ and a C compiler (cgo).
 
 ```sh
-./build.sh                     # -> cliproxy-tracing-v0.1.0.so (linux/amd64)
+./build.sh                     # -> cliproxy-tracing-v0.1.1.so (linux/amd64)
 ARCH=arm64 ./build.sh          # native arm64 build
 ./build-release.sh             # plugin-store artifacts in dist/
 ```
