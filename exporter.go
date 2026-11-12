@@ -19,6 +19,13 @@ import (
 const (
 	// One export attempt may not block the loop for longer than this.
 	maxExportTimeout = 30 * time.Second
+	// PostHog and comparable OTLP backends reject a request body above 4 MiB
+	// with a 413 and discard every span in it, so no batch may be allowed to
+	// approach that size. maxExportBytes is the hard ceiling the config may set;
+	// the default budget is lower, leaving room for the resource and scope
+	// envelope and for a backend with a slightly different limit.
+	maxExportBytes      = 4 << 20
+	defaultExportBudget = 3 << 20
 	// The queue is bounded so a failing endpoint cannot grow memory without
 	// limit; oldest spans go first and the drop is counted.
 	maxQueuedSpans = 20000
@@ -30,6 +37,21 @@ const (
 )
 
 var errHostCallFailed = errors.New("host call failed")
+
+// permanentError is a rejection retrying the same payload cannot fix: an
+// oversized body, a bad token, a malformed attribute. The caller may still
+// recover by splitting the batch, but a straight resend is pointless.
+type permanentError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *permanentError) Error() string { return e.Message }
+
+// isPayloadTooLarge reports the one permanent error a smaller batch survives.
+func (e *permanentError) isPayloadTooLarge() bool {
+	return e.StatusCode == http.StatusRequestEntityTooLarge
+}
 
 // exporter drains finished traces and posts OTLP/HTTP JSON in the background.
 // It owns the only network path in the plugin.
@@ -45,6 +67,11 @@ type exporter struct {
 	failures int
 	lastErr  string
 	nextTry  time.Time
+
+	// queue holds spans whose export failed transiently. They are retried on a
+	// later flush instead of being dropped, so a brief backend outage does not
+	// lose the traces that happened during it.
+	queue []otlpSpan
 
 	sent    uint64
 	dropped uint64
@@ -89,6 +116,31 @@ func (e *exporter) ready(now time.Time) bool {
 	return e.endpoint != "" && !now.Before(e.nextTry)
 }
 
+// requeue puts transiently-failed spans back for a later attempt. The queue is
+// bounded: past the limit the oldest are dropped and counted, so an endpoint
+// that stays down costs memory only up to the bound rather than without limit.
+func (e *exporter) requeue(spans []otlpSpan) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.queue = append(e.queue, spans...)
+	if over := len(e.queue) - maxQueuedSpans; over > 0 {
+		e.queue = append(e.queue[:0], e.queue[over:]...)
+		e.dropped += uint64(over)
+	}
+}
+
+// takeQueued returns and clears the retry queue.
+func (e *exporter) takeQueued() []otlpSpan {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.queue) == 0 {
+		return nil
+	}
+	out := e.queue
+	e.queue = nil
+	return out
+}
+
 func (e *exporter) status() (sent, dropped uint64, lastErr string, failures int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -98,6 +150,17 @@ func (e *exporter) status() (sent, dropped uint64, lastErr string, failures int)
 // send posts one OTLP batch. Empty endpoint means no export at all, which is
 // the default so an unconfigured install sends nothing.
 func (e *exporter) send(ctx context.Context, req otlpRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("encode otlp batch: %w", err)
+	}
+	return e.sendEncoded(ctx, body)
+}
+
+// sendEncoded posts an already-encoded OTLP batch. A caller that had to know
+// the exact request size encodes once and hands the bytes here, so the batch is
+// not marshalled twice.
+func (e *exporter) sendEncoded(ctx context.Context, body []byte) error {
 	e.mu.Lock()
 	endpoint, headers, client := e.endpoint, e.headers, e.client
 	e.mu.Unlock()
@@ -109,10 +172,6 @@ func (e *exporter) send(ctx context.Context, req otlpRequest) error {
 		return errors.New("no http client")
 	}
 
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("encode otlp batch: %w", err)
-	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		// The endpoint can carry credentials in its userinfo; never echo it.
@@ -137,6 +196,13 @@ func (e *exporter) send(ctx context.Context, req otlpRequest) error {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg := fmt.Sprintf("http %d: %s", resp.StatusCode, truncateText(string(respBody), 400))
+		// A 4xx (other than a rate limit) means this exact payload will always
+		// be refused, so it is reported as permanent. 413 in particular is
+		// recoverable by sending fewer spans, which the caller does.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+			e.recordFailure(msg)
+			return &permanentError{StatusCode: resp.StatusCode, Message: msg}
+		}
 		e.recordFailure(msg)
 		return fmt.Errorf("%s", msg)
 	}

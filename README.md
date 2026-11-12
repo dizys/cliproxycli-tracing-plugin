@@ -90,11 +90,13 @@ Settings live under `plugins.configs.cliproxy-tracing`. Every key is optional.
 | `service_name` | string | `cliproxyapi` | OpenTelemetry `service.name`. |
 | `capture_content` | boolean | `false` | Export prompt and completion text. |
 | `max_content_chars` | integer | `32768` | Longest single message exported. |
+| `max_trace_content_bytes` | integer | `524288` | Largest prompt or completion exported for one trace. |
 | `require_complete` | boolean | `true` | Skip requests whose completion did not finish. |
 | `sample_rate` | number | `1` | Fraction of traces to export, decided per trace. |
 | `export_timeout_ms` | integer | `10000` | Per-attempt HTTP timeout. |
 | `flush_interval_ms` | integer | `1000` | How often queued spans are exported. |
 | `max_batch_spans` | integer | `512` | Spans per export request. |
+| `max_batch_bytes` | integer | `3145728` | Encoded size cap for one export request. |
 | `completion_grace_ms` | integer | `2000` | How long a finished request waits for late usage records. |
 
 ### Content capture
@@ -120,10 +122,31 @@ arrive as fragments and are joined in order. Plain text parts are exported as
 their text alone, with no type prefix.
 
 Three limits apply. Content above `max_content_chars` per message is truncated
-with a marker. Bodies above 4 MiB and completions above 2 MiB are truncated at
-capture time, and the span records that it happened. `require_complete` drops
+with a marker. A prompt or completion above `max_trace_content_bytes` is clipped
+too: the oldest turns of a long conversation are dropped and the first remaining
+message is marked, so the most recent exchange, which is the one being traced,
+always survives. Bodies above 4 MiB and completions above 2 MiB are truncated at
+capture time. The span records every truncation. `require_complete` drops
 requests that did not finish, so the export holds whole exchanges rather than
 fragments.
+
+### Export sizing
+
+Backends enforce a body limit on an ingest request and reject an oversized one
+whole: PostHog answers `413` above 4 MiB and discards every span in the request,
+not just the large one. A batch therefore has to be split before it gets there.
+
+Two things keep it under the limit. Content is attached to one span per trace,
+the attempt that answered, rather than to the root and every retry span, which
+had multiplied a long conversation by the attempt count. And batches split on
+encoded bytes as well as span count, with a 3 MiB default budget that leaves
+headroom under the 4 MiB limit. A batch that is still refused is halved and
+retried rather than dropped.
+
+Transient failures, meaning a network error, a 5xx, or a `429`, return their
+spans to a bounded retry queue and are resent after a backoff, so a backend
+restart does not lose the traffic that happened during it. Queue overflow drops
+the oldest spans and the count is reported.
 
 ### What is never captured
 
@@ -150,7 +173,7 @@ reported to the host log.
 Requires Go 1.24+ and a C compiler (cgo).
 
 ```sh
-./build.sh                     # -> cliproxy-tracing-v0.1.2.so (linux/amd64)
+./build.sh                     # -> cliproxy-tracing-v0.1.3.so (linux/amd64)
 ARCH=arm64 ./build.sh          # native arm64 build
 ./build-release.sh             # plugin-store artifacts in dist/
 ```

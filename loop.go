@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 )
@@ -64,25 +66,32 @@ func (p *pluginInstance) runLoop() {
 
 // flushOnce drains and sends one round of spans.
 func (p *pluginInstance) flushOnce(ctx context.Context) {
-	traces := p.store.drain()
-	if len(traces) == 0 {
-		p.store.reap(time.Now())
-		return
-	}
-
 	cfg := p.config.get()
-	if !cfg.active() {
-		// Nothing configured: the traces are dropped, not queued. This is the
-		// default state, so an unconfigured install accumulates nothing.
+	now := time.Now()
+
+	// Spans whose earlier export failed go out first, before new ones, so the
+	// retry queue does not grow behind a steady stream of fresh traffic.
+	retry := p.exp.takeQueued()
+
+	if !cfg.active() || !p.exp.ready(now) {
+		// Nothing configured, or the endpoint is inside its backoff window.
+		// Queued spans are kept rather than flushed into a failing backend, and
+		// traces stay in the store until a later tick.
+		if len(retry) > 0 {
+			p.exp.requeue(retry)
+		}
+		p.store.reap(now)
 		return
 	}
 
-	now := time.Now()
+	traces := p.store.drain()
 
 	// A trace waits CompletionGrace for late usage records before it is built,
 	// so an attempt that arrives a moment after the completion still joins.
 	p.mu.Lock()
-	p.held = append(p.held, heldTrace{traces: traces, readyAt: now.Add(cfg.CompletionGrace)})
+	if len(traces) > 0 {
+		p.held = append(p.held, heldTrace{traces: traces, readyAt: now.Add(cfg.CompletionGrace)})
+	}
 	ready := make([]*finishedTrace, 0, len(p.held))
 	stillHeld := p.held[:0]
 	for _, h := range p.held {
@@ -95,26 +104,170 @@ func (p *pluginInstance) flushOnce(ctx context.Context) {
 	p.held = stillHeld
 	p.mu.Unlock()
 
-	if len(ready) == 0 {
-		return
+	// Retries go first: they are already behind, and sending them ahead of new
+	// traffic keeps the queue from growing behind a steady stream.
+	all := make([]otlpSpan, 0, len(retry)+len(ready)*2)
+	all = append(all, retry...)
+	for _, tr := range ready {
+		all = append(all, buildTraceSpans(tr, cfg, now)...)
 	}
 
-	spans := make([]otlpSpan, 0, len(ready)*2)
-	for _, tr := range ready {
-		spans = append(spans, buildTraceSpans(tr, cfg, now)...)
-		if len(spans) >= cfg.MaxBatchSpans {
-			p.exportBatch(ctx, cfg, spans)
-			spans = spans[:0]
-		}
-	}
-	if len(spans) > 0 {
-		p.exportBatch(ctx, cfg, spans)
+	for _, batch := range splitBatches(cfg, all) {
+		p.sendBatch(ctx, cfg, batch)
 	}
 	p.store.reap(now)
 }
 
+// encodedBatch is one export request. Each span is marshalled once: the bytes
+// are reused to measure the batch, to assemble it, and to post it.
+type encodedBatch struct {
+	spans []otlpSpan
+	parts [][]byte
+}
+
+// body assembles the OTLP envelope around the already-encoded spans.
+func (b encodedBatch) body(cfg config) []byte {
+	head, _ := json.Marshal(otlpRequest{
+		ResourceSpans: []otlpResourceSpans{{
+			Resource: otlpResource{Attributes: resourceAttrs(cfg)},
+			ScopeSpans: []otlpScopeSpans{{
+				Scope: otlpScope{Name: "cliproxy-tracing", Version: pluginVersion},
+				Spans: []otlpSpan{},
+			}},
+		}},
+	})
+	// head ends its span list with an empty "spans":[]; splice the encoded
+	// spans into it rather than re-marshalling the whole request.
+	marker := []byte(`"spans":[]`)
+	idx := bytes.Index(head, marker)
+	if idx < 0 {
+		raw, _ := json.Marshal(encodeBatch(cfg, b.spans))
+		return raw
+	}
+	size := len(head)
+	for _, p := range b.parts {
+		size += len(p) + 1
+	}
+	out := make([]byte, 0, size)
+	out = append(out, head[:idx]...)
+	out = append(out, `"spans":[`...)
+	for i, p := range b.parts {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, p...)
+	}
+	out = append(out, ']')
+	out = append(out, head[idx+len(marker):]...)
+	return out
+}
+
+// splitBatches divides spans into export requests that each fit under the
+// backend's body limit.
+//
+// A count-only limit is not enough: 512 spans of an agent conversation is many
+// megabytes, and a backend rejects an oversized request whole, losing every
+// span in it. JSON escaping also expands content, so the size has to be
+// measured after encoding rather than estimated from the raw strings.
+func splitBatches(cfg config, spans []otlpSpan) []encodedBatch {
+	if len(spans) == 0 {
+		return nil
+	}
+	budget := cfg.MaxBatchBytes
+	if budget <= 0 || budget > maxExportBytes {
+		budget = defaultExportBudget
+	}
+	maxSpans := cfg.MaxBatchSpans
+	if maxSpans <= 0 {
+		maxSpans = 512
+	}
+
+	var out []encodedBatch
+	cur := encodedBatch{}
+	size := envelopeBytes
+
+	for _, span := range spans {
+		raw, err := json.Marshal(span)
+		if err != nil {
+			continue
+		}
+		n := len(raw) + 1 // the comma joining it to the previous span
+		// A single span over the whole budget still has to go somewhere, so it
+		// is sent alone rather than dropped; only the backend can refuse it.
+		if len(cur.spans) > 0 && (len(cur.spans) >= maxSpans || size+n > budget) {
+			out = append(out, cur)
+			cur = encodedBatch{}
+			size = envelopeBytes
+		}
+		cur.spans = append(cur.spans, span)
+		cur.parts = append(cur.parts, raw)
+		size += n
+	}
+	if len(cur.spans) > 0 {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// envelopeBytes is what the resource, scope and JSON framing add to a batch
+// that holds no spans. Measured from the real encoding rather than guessed.
+var envelopeBytes = func() int {
+	raw, _ := json.Marshal(encodeBatch(defaultConfig(), []otlpSpan{}))
+	return len(raw)
+}()
+
 func (p *pluginInstance) exportBatch(ctx context.Context, cfg config, spans []otlpSpan) {
-	req := otlpRequest{
+	for _, batch := range splitBatches(cfg, spans) {
+		p.sendBatch(ctx, cfg, batch)
+	}
+}
+
+// sendBatch posts one encoded batch and routes a failure.
+func (p *pluginInstance) sendBatch(ctx context.Context, cfg config, batch encodedBatch) {
+	if len(batch.spans) == 0 {
+		return
+	}
+	if err := p.exp.sendEncoded(ctx, batch.body(cfg)); err != nil {
+		p.handleSendError(ctx, cfg, batch, err)
+	}
+}
+
+// handleSendError routes a failed export. A 413 is the one rejection a smaller
+// batch survives, so it is split; a transient failure is requeued; anything
+// else permanent is reported and dropped.
+func (p *pluginInstance) handleSendError(ctx context.Context, cfg config, batch encodedBatch, err error) {
+	var permanent *permanentError
+	if errors.As(err, &permanent) {
+		if permanent.isPayloadTooLarge() && len(batch.spans) > 1 {
+			mid := len(batch.spans) / 2
+			for _, half := range splitBatches(cfg, batch.spans[:mid]) {
+				p.sendBatch(ctx, cfg, half)
+			}
+			for _, half := range splitBatches(cfg, batch.spans[mid:]) {
+				p.sendBatch(ctx, cfg, half)
+			}
+			return
+		}
+		if permanent.isPayloadTooLarge() {
+			// One span larger than the backend's whole request limit. It can
+			// never be sent, so say so rather than retrying forever.
+			p.log("warn", "export rejected, span too large for the backend: "+sanitizeError(err))
+			return
+		}
+		p.log("warn", "export rejected: "+sanitizeError(err))
+		return
+	}
+	// Transient (a network error, a 5xx, a rate limit): the spans go back on
+	// the queue to be retried once the backoff expires, rather than being
+	// dropped. This is what stops a rolling backend restart from losing every
+	// trace that happened during it.
+	p.exp.requeue(batch.spans)
+	p.log("warn", "export failed, will retry: "+sanitizeError(err))
+}
+
+// encodeBatch wraps spans in the OTLP resource and scope envelope.
+func encodeBatch(cfg config, spans []otlpSpan) otlpRequest {
+	return otlpRequest{
 		ResourceSpans: []otlpResourceSpans{{
 			Resource: otlpResource{Attributes: resourceAttrs(cfg)},
 			ScopeSpans: []otlpScopeSpans{{
@@ -122,9 +275,6 @@ func (p *pluginInstance) exportBatch(ctx context.Context, cfg config, spans []ot
 				Spans: spans,
 			}},
 		}},
-	}
-	if err := p.exp.send(ctx, req); err != nil {
-		p.log("warn", "export failed: "+sanitizeError(err))
 	}
 }
 

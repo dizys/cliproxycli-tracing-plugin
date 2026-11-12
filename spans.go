@@ -144,14 +144,6 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 		EndTimeUnixNano:   unixNano(tr.CompletedAt),
 	}
 
-	// Content goes on both the root and the attempt span. PostHog reads the
-	// gen_ai.* message attributes for a generation; Langfuse reads its native
-	// langfuse.observation.* ones and prefers them. Emitting both means one
-	// export serves either backend with no per-backend configuration.
-	if cfg.CaptureContent {
-		addContentAttrs(&root, tr, cfg)
-	}
-
 	// A successful request is not always unremarkable: the root carries the
 	// outcome so a filtered dashboard can still tell cancellations from errors.
 	if tr.Outcome != "" && tr.Outcome != "succeeded" {
@@ -159,6 +151,11 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 		if tr.Error != "" {
 			root.str("cpa.error", truncateText(tr.Error, maxErrorAttrBytes))
 		}
+	}
+	// With no attempt recorded there is no child span to carry the
+	// conversation, so the root takes it rather than losing it.
+	if cfg.CaptureContent && len(tr.Attempts) == 0 {
+		addContentAttrs(&root, tr, cfg)
 	}
 	rootSpan.Attributes = root
 
@@ -203,11 +200,17 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 			StartTimeUnixNano: unixNano(u.RequestedAt),
 			EndTimeUnixNano:   unixNano(attemptEnd(u)),
 		}
-		if cfg.CaptureContent {
+		if cfg.CaptureContent && i == len(tr.Attempts)-1 {
+			// Content goes on the attempt that produced the answer, and only
+			// there. Repeating the same conversation on every retry span
+			// multiplies a large payload by the attempt count, which is how an
+			// export batch reached the backend's 4 MiB body limit and was
+			// rejected whole.
+			//
+			// Langfuse renders a generation from the observation attributes on
+			// whichever span carries them, so the child span is still the
+			// generation rather than the root.
 			addContentAttrs(&a, tr, cfg)
-			// Langfuse renders generations from the observation attributes on
-			// whichever span it is attached to; putting them on the attempt is
-			// what makes the child span the generation rather than the root.
 		}
 		if u.Failed {
 			if u.Failure.StatusCode > 0 {
@@ -226,9 +229,15 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 
 // addContentAttrs attaches the conversation to a span in every dialect the
 // supported backends read.
+//
+// Content is emitted once per trace, not once per span. A request with three
+// upstream attempts would otherwise carry the same multi-hundred-kilobyte
+// conversation four times, which is how a batch reaches a backend's body limit.
+// The attempt span is the generation for both PostHog and Langfuse, so content
+// belongs there; the root keeps only the provenance flags.
 func addContentAttrs(a *attrs, tr *finishedTrace, cfg config) {
-	prompt := parsePromptMessages(tr.PromptJSON)
-	out := completionMessages(tr)
+	prompt := trimPrompt(parsePromptMessages(tr.PromptJSON), cfg)
+	out := completionMessages(tr, cfg)
 
 	if len(prompt) > 0 {
 		if raw, err := json.Marshal(trimMessages(prompt, cfg)); err == nil {
@@ -279,11 +288,58 @@ func addContentAttrs(a *attrs, tr *finishedTrace, cfg config) {
 }
 
 // completionMessages shapes the captured completion as an assistant message.
-func completionMessages(tr *finishedTrace) []chatMessage {
+func completionMessages(tr *finishedTrace, cfg config) []chatMessage {
 	if len(tr.Completion) == 0 {
 		return nil
 	}
-	return []chatMessage{{Role: "assistant", Content: string(tr.Completion)}}
+	text := string(tr.Completion)
+	if cap := cfg.MaxTraceContentBytes; cap > 0 && len(text) > cap {
+		text = text[:cap] + "\n...[truncated]"
+	}
+	return []chatMessage{{Role: "assistant", Content: text}}
+}
+
+// trimPrompt applies the per-trace content cap, then the per-message cap.
+//
+// A long agent conversation is over the backend's body limit long before it is
+// over any per-message limit: twenty turns of tool traffic at 40 KiB each is
+// 800 KiB in one span. The oldest messages are dropped rather than the newest,
+// because the most recent turns are the ones that describe the exchange being
+// traced, and the removal is marked so a consumer can tell a short conversation
+// from a clipped one.
+func trimPrompt(msgs []chatMessage, cfg config) []chatMessage {
+	cap := cfg.MaxTraceContentBytes
+	if cap <= 0 || len(msgs) == 0 {
+		return trimMessages(msgs, cfg)
+	}
+
+	total := 0
+	for _, m := range msgs {
+		total += len(m.Content)
+	}
+	// Keep the tail: drop from the front until it fits, always leaving the
+	// newest message.
+	drop := 0
+	for total > cap && drop < len(msgs)-1 {
+		total -= len(msgs[drop].Content)
+		drop++
+	}
+	if drop > 0 {
+		msgs = msgs[drop:]
+		// Say that a prefix was removed, so the first remaining turn is not
+		// mistaken for the start of the conversation.
+		msgs[0] = chatMessage{Role: msgs[0].Role, Content: "...[earlier messages omitted]\n" + msgs[0].Content}
+		total = 0
+		for _, m := range msgs {
+			total += len(m.Content)
+		}
+	}
+	// One message can still be over the cap on its own, usually a pasted file.
+	// Left alone it would make a span larger than the budget, so it is clipped.
+	if total > cap && len(msgs) == 1 {
+		msgs[0].Content = truncateText(msgs[0].Content, cap)
+	}
+	return trimMessages(msgs, cfg)
 }
 
 // trimMessages applies the configured per-content cap so a huge prompt does not

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -427,6 +431,253 @@ func TestShutdownAfterRegisterCompletes(t *testing.T) {
 	}
 }
 
+// --- export size -----------------------------------------------------------
+// A backend rejects an oversized export request whole, so every span in it is
+// lost. These pin the two guards that keep a batch under the limit: content is
+// carried once per trace rather than once per span, and the batch is split on
+// bytes as well as span count.
+
+func TestContentIsNotDuplicatedAcrossAttemptSpans(t *testing.T) {
+	tr := &finishedTrace{
+		TraceID: "t", RequestID: "r", Outcome: "succeeded",
+		StartedAt: base, CompletedAt: base.Add(time.Second),
+		PromptJSON: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+		Completion: []byte("hi"),
+		Attempts: []usageRecord{
+			{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second, Failed: true},
+			{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second},
+			{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second},
+		},
+	}
+	spans := buildTraceSpans(tr, testConfig(), base)
+
+	withContent := 0
+	for _, span := range spans {
+		if attrKeys(span.Attributes)["gen_ai.input.messages"] != "" {
+			withContent++
+		}
+	}
+	if withContent != 1 {
+		t.Fatalf("content appears on %d spans, want exactly 1", withContent)
+	}
+}
+
+// With no usage record there is no attempt span, so the root must take the
+// content rather than losing it.
+func TestContentFallsBackToRootWithoutAttempts(t *testing.T) {
+	tr := &finishedTrace{
+		TraceID: "t2", RequestID: "r2", Outcome: "succeeded",
+		StartedAt: base, CompletedAt: base.Add(time.Second),
+		PromptJSON: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+		Completion: []byte("hi"),
+	}
+	spans := buildTraceSpans(tr, testConfig(), base)
+	if got := attrKeys(spans[0].Attributes)["gen_ai.input.messages"]; got == "" {
+		t.Fatal("content lost when a trace has no attempts")
+	}
+}
+
+// A long conversation must be clipped to the per-trace budget, and clipping
+// must drop the oldest turns rather than the newest: the most recent exchange
+// is the one being traced.
+func TestLongPromptIsClippedFromTheFront(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxTraceContentBytes = 1000
+	cfg.MaxContentChars = 1 << 20
+
+	body := `{"messages":[`
+	for i := 0; i < 40; i++ {
+		if i > 0 {
+			body += ","
+		}
+		body += `{"role":"user","content":"` + strings.Repeat("a", 100) + `"},{"role":"assistant","content":"` + strings.Repeat("b", 100) + `"}`
+	}
+	body += `,{"role":"user","content":"THE-NEWEST-TURN"}]}`
+
+	msgs := trimPrompt(parsePromptMessages([]byte(body)), cfg)
+	if len(msgs) == 0 {
+		t.Fatal("clipping dropped every message")
+	}
+	total := 0
+	for _, m := range msgs {
+		total += len(m.Content)
+	}
+	if total > cfg.MaxTraceContentBytes+200 { // one message may exceed the cap alone
+		t.Fatalf("clipped prompt is %d bytes, budget %d", total, cfg.MaxTraceContentBytes)
+	}
+	if !strings.Contains(msgs[len(msgs)-1].Content, "THE-NEWEST-TURN") {
+		t.Fatal("clipping dropped the newest turn instead of the oldest")
+	}
+	if !strings.Contains(msgs[0].Content, "earlier messages omitted") {
+		t.Fatal("clipping did not mark the removed prefix")
+	}
+}
+
+func TestCompletionIsClipped(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxTraceContentBytes = 100
+	out := completionMessages(&finishedTrace{Completion: []byte(strings.Repeat("x", 500))}, cfg)
+	if len(out) != 1 {
+		t.Fatalf("got %d messages", len(out))
+	}
+	if len(out[0].Content) > 200 {
+		t.Fatalf("completion not clipped: %d bytes", len(out[0].Content))
+	}
+	if !strings.Contains(out[0].Content, "truncated") {
+		t.Fatal("clipped completion is not marked")
+	}
+}
+
+// No batch that leaves the plugin may exceed the backend's body limit. PostHog
+// rejects a body over 4 MiB with a 413 and discards every span in the request,
+// so the split is checked against the real encoded size, escaping included.
+func TestBatchesStayUnderBackendLimit(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxBatchBytes = 1 << 20
+
+	var spans []otlpSpan
+	for i := 0; i < 40; i++ {
+		var a attrs
+		// Quotes and newlines encode larger than their raw bytes, which is the
+		// case an estimate gets wrong.
+		a.str("gen_ai.input.messages", strings.Repeat(`"line"
+`, 8000))
+		spans = append(spans, otlpSpan{TraceID: "t", SpanID: "s", Name: "s", Attributes: a})
+	}
+
+	batches := splitBatches(cfg, spans)
+	if len(batches) < 2 {
+		t.Fatalf("%d spans of ~96 KiB produced %d batch(es); the byte cap was not applied", len(spans), len(batches))
+	}
+
+	total := 0
+	for i, batch := range batches {
+		total += len(batch.spans)
+		body := batch.body(cfg)
+		if len(body) > cfg.MaxBatchBytes {
+			t.Fatalf("batch %d encodes to %d bytes, over the %d budget", i, len(body), cfg.MaxBatchBytes)
+		}
+		// The splice must produce valid JSON, or the backend sees a broken body.
+		var decoded otlpRequest
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatalf("batch %d is not valid JSON: %v", i, err)
+		}
+		if got := len(decoded.ResourceSpans[0].ScopeSpans[0].Spans); got != len(batch.spans) {
+			t.Fatalf("batch %d has %d spans after encoding, want %d", i, got, len(batch.spans))
+		}
+	}
+	if total != len(spans) {
+		t.Fatalf("split kept %d of %d spans", total, len(spans))
+	}
+}
+
+// A single span larger than the whole budget is still sent, alone: dropping it
+// would lose the trace, and only the backend can refuse it.
+func TestOversizedSingleSpanIsStillSent(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxBatchBytes = 64 << 10
+
+	var a attrs
+	a.str("k", strings.Repeat("x", 500*1024))
+	batches := splitBatches(cfg, []otlpSpan{{Name: "s", Attributes: a}})
+
+	if len(batches) != 1 || len(batches[0].spans) != 1 {
+		t.Fatalf("oversized span was dropped: %d batches", len(batches))
+	}
+}
+
+// A transient failure must not drop the spans; they are retried.
+func TestTransientFailureIsRequeued(t *testing.T) {
+	resetPlugin(t)
+
+	var a attrs
+	a.str("k", "v")
+	spans := []otlpSpan{{Name: "s", Attributes: a}}
+	plugin.exp.requeue(spans)
+
+	if got := plugin.exp.takeQueued(); len(got) != 1 {
+		t.Fatalf("requeued %d spans, want 1", len(got))
+	}
+	if got := plugin.exp.takeQueued(); len(got) != 0 {
+		t.Fatalf("queue not cleared: %d", len(got))
+	}
+}
+
+// The retry queue is bounded so a permanently failing endpoint cannot grow
+// memory without limit.
+func TestRetryQueueIsBounded(t *testing.T) {
+	e := newExporter()
+	e.requeue(make([]otlpSpan, maxQueuedSpans+50))
+	if got := len(e.takeQueued()); got > maxQueuedSpans {
+		t.Fatalf("queue grew to %d, cap is %d", got, maxQueuedSpans)
+	}
+}
+
+// A 413 is the one rejection a smaller batch survives. Before this, the whole
+// batch was dropped and every trace in it was lost; live PostHog rejected 386
+// exports this way.
+func TestOversizedBatchIsSplitRatherThanDropped(t *testing.T) {
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		posts++
+		body, _ := io.ReadAll(req.Body)
+		if len(body) > 4096 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":"maximum event size exceeded"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	resetPlugin(t)
+	cfg := testConfig()
+	cfg.Endpoint = srv.URL
+	cfg.ExportTimeout = 5 * time.Second
+	plugin.config.set(cfg)
+	plugin.exp.configure(cfg)
+
+	var spans []otlpSpan
+	for i := 0; i < 32; i++ {
+		var a attrs
+		a.str("gen_ai.input.messages", strings.Repeat("q", 300))
+		spans = append(spans, otlpSpan{TraceID: "t", SpanID: "s", Name: "s", Attributes: a})
+	}
+	plugin.exportBatch(context.Background(), cfg, spans)
+
+	if posts < 2 {
+		t.Fatalf("oversized batch was sent %d time(s); it was dropped instead of split", posts)
+	}
+	if got := plugin.exp.takeQueued(); len(got) != 0 {
+		t.Fatalf("%d spans landed in the retry queue; a 413 is not transient", len(got))
+	}
+}
+
+// A 503 must be retried, not dropped: a backend restart should not lose the
+// traces that happened during it.
+func TestServerErrorIsRequeued(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	resetPlugin(t)
+	cfg := testConfig()
+	cfg.Endpoint = srv.URL
+	cfg.ExportTimeout = 5 * time.Second
+	plugin.config.set(cfg)
+	plugin.exp.configure(cfg)
+
+	var a attrs
+	a.str("k", "v")
+	plugin.exportBatch(context.Background(), cfg, []otlpSpan{{Name: "s", Attributes: a}})
+
+	if got := plugin.exp.takeQueued(); len(got) != 1 {
+		t.Fatalf("%d spans requeued after a 503, want 1", len(got))
+	}
+}
+
 // --- helpers --------------------------------------------------------------
 
 func attrKeys(list []otlpKeyValue) map[string]string {
@@ -449,4 +700,20 @@ func mustJSON(t *testing.T, v any) []byte {
 		t.Fatalf("marshal: %v", err)
 	}
 	return raw
+}
+
+// A single pasted file can exceed the per-trace cap on its own. It must be
+// clipped, or the span it lives in is larger than the backend will accept.
+func TestSingleOversizedMessageIsClipped(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxTraceContentBytes = 1000
+	cfg.MaxContentChars = 1 << 20
+
+	msgs := trimPrompt([]chatMessage{{Role: "user", Content: strings.Repeat("x", 50000)}}, cfg)
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages", len(msgs))
+	}
+	if len(msgs[0].Content) > 1000 {
+		t.Fatalf("single message kept %d bytes, cap is %d", len(msgs[0].Content), cfg.MaxTraceContentBytes)
+	}
 }

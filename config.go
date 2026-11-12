@@ -29,6 +29,11 @@ type config struct {
 	CaptureContent bool
 	// MaxContentChars caps one message's content attribute.
 	MaxContentChars int
+	// MaxTraceContentBytes caps the whole content of one trace, prompt and
+	// completion each. A conversation with many turns would otherwise build an
+	// export larger than the backend accepts, and a backend rejects the whole
+	// request, not just the oversized span.
+	MaxTraceContentBytes int
 	// RequireComplete drops requests whose completion did not finish, so an
 	// export is usable for analysis rather than full of half-answers.
 	RequireComplete bool
@@ -38,6 +43,10 @@ type config struct {
 	ExportTimeout time.Duration
 	FlushInterval time.Duration
 	MaxBatchSpans int
+	// MaxBatchBytes caps one OTLP export request. Backends enforce a hard body
+	// limit (PostHog: 4 MiB) and answer 413 above it, discarding every span in
+	// the batch, so this is kept under that with headroom.
+	MaxBatchBytes int
 
 	// CompletionGrace is how long a finished request waits for late usage
 	// records before its trace is closed without them.
@@ -46,17 +55,19 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		Enabled:         true,
-		Headers:         map[string]string{},
-		ServiceName:     "cliproxyapi",
-		CaptureContent:  false,
-		MaxContentChars: 32 * 1024,
-		RequireComplete: true,
-		SampleRate:      1,
-		ExportTimeout:   10 * time.Second,
-		FlushInterval:   time.Second,
-		MaxBatchSpans:   512,
-		CompletionGrace: 2 * time.Second,
+		Enabled:              true,
+		Headers:              map[string]string{},
+		ServiceName:          "cliproxyapi",
+		CaptureContent:       false,
+		MaxContentChars:      32 * 1024,
+		MaxTraceContentBytes: 512 * 1024,
+		RequireComplete:      true,
+		SampleRate:           1,
+		ExportTimeout:        10 * time.Second,
+		FlushInterval:        time.Second,
+		MaxBatchSpans:        512,
+		MaxBatchBytes:        defaultExportBudget,
+		CompletionGrace:      2 * time.Second,
 	}
 }
 
@@ -112,11 +123,13 @@ func parseConfig(raw []byte) (config, []string, error) {
 		}
 	}
 	intField(values, "max_content_chars", &cfg.MaxContentChars, 256, 1<<20, &warnings)
+	intField(values, "max_trace_content_bytes", &cfg.MaxTraceContentBytes, 4096, 4<<20, &warnings)
 	floatField(values, "sample_rate", &cfg.SampleRate, 0, 1, &warnings)
 	durationField(values, "export_timeout_ms", &cfg.ExportTimeout, 100*time.Millisecond, maxExportTimeout, &warnings)
 	durationField(values, "flush_interval_ms", &cfg.FlushInterval, 50*time.Millisecond, time.Minute, &warnings)
 	durationField(values, "completion_grace_ms", &cfg.CompletionGrace, 0, 5*time.Minute, &warnings)
 	intField(values, "max_batch_spans", &cfg.MaxBatchSpans, 1, 10000, &warnings)
+	intField(values, "max_batch_bytes", &cfg.MaxBatchBytes, 64<<10, maxExportBytes, &warnings)
 
 	headers, headerWarnings := parseHeaders(values["headers"])
 	cfg.Headers = headers
@@ -264,11 +277,13 @@ func configFields() []configField {
 		{"service_name", "string", d.ServiceName, "OpenTelemetry service.name resource attribute."},
 		{"capture_content", "boolean", d.CaptureContent, "Export prompt and completion text. Off by default."},
 		{"max_content_chars", "integer", d.MaxContentChars, "Longest single message content exported, in characters."},
+		{"max_trace_content_bytes", "integer", d.MaxTraceContentBytes, "Largest prompt or completion exported for one trace, in bytes. Longer conversations are truncated from the middle of the oldest messages."},
 		{"require_complete", "boolean", d.RequireComplete, "Skip requests whose completion did not finish, so exports contain complete exchanges only."},
 		{"sample_rate", "number", d.SampleRate, "Fraction of traces to export (0..1)."},
 		{"export_timeout_ms", "integer", d.ExportTimeout.Milliseconds(), "HTTP timeout for one export attempt."},
 		{"flush_interval_ms", "integer", d.FlushInterval.Milliseconds(), "How often queued spans are exported."},
 		{"max_batch_spans", "integer", d.MaxBatchSpans, "Spans per export request."},
+		{"max_batch_bytes", "integer", d.MaxBatchBytes, "Encoded size cap for one export request. Backends reject an oversized body and discard every span in it, so batches are split under this."},
 		{"completion_grace_ms", "integer", d.CompletionGrace.Milliseconds(), "How long a finished request waits for late usage records."},
 	}
 }
