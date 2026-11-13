@@ -1,6 +1,8 @@
 package main
 
 import (
+	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -24,15 +26,29 @@ const (
 )
 
 const (
-	pluginID      = "cliproxy-tracing"
-	pluginName    = "CLIProxy Tracing"
-	pluginAuthor  = "dizys"
-	pluginRepo    = "https://github.com/dizys/cliproxycli-tracing-plugin"
-	pluginLogoURL = "https://raw.githubusercontent.com/dizys/cliproxycli-tracing-plugin/main/assets/icon.svg"
+	pluginID     = "cliproxy-tracing"
+	pluginName   = "CLIProxy Tracing"
+	pluginAuthor = "dizys"
+	pluginRepo   = "https://github.com/dizys/cliproxycli-tracing-plugin"
 )
 
+// iconSVG is embedded so the logo travels with the binary. The host reads
+// metadata once, at plugin.register, before any resource path is assigned, so a
+// self-contained URI is the only way the icon renders without the host having to
+// fetch a URL: a raw GitHub link fails on an offline or air-gapped install and
+// depends on the repository's default branch staying named "main".
+//
+//go:embed assets/icon.svg
+var iconSVG []byte
+
+// iconDataURI renders the icon for the registration metadata. The host escapes
+// attribute values, which leaves a base64 payload intact.
+func iconDataURI() string {
+	return "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(iconSVG)
+}
+
 // pluginVersion is overridden at build time with -X main.pluginVersion=<version>.
-var pluginVersion = "0.2.0"
+var pluginVersion = "0.2.1"
 
 var plugin = newPluginInstance()
 
@@ -114,7 +130,7 @@ func handleRegister(req []byte) ([]byte, error) {
 			Version:          pluginVersion,
 			Author:           pluginAuthor,
 			GitHubRepository: pluginRepo,
-			Logo:             pluginLogoURL,
+			Logo:             iconDataURI(),
 			ConfigFields:     configFields(),
 		},
 		Capabilities: pluginCapabilities{
