@@ -179,23 +179,29 @@ jobs:
             entry="$(unzip -Z1 "dist/${name}")"
             test "${entry}" = "cliproxy-tracing.${ext}" || {
               echo "${name} holds ${entry}, want cliproxy-tracing.${ext}"; exit 1; }
-            # A cross build can succeed and still emit the host architecture, so
-            # read the machine out of the binary itself. windows/arm64 is the
-            # one most likely to be wrong: mingw cannot target it, and only a
-            # real arm64 toolchain produces machine 0xAA64.
+            # A cross build can succeed and still emit the wrong architecture,
+            # so check two independent things: what the binary says it was
+            # built for, and what the machine code actually is. `file` spells
+            # arm64 differently across versions and platforms ("ARM64",
+            # "Aarch64", "aarch64"), so the match is case-insensitive.
             rm -rf /tmp/verify && mkdir -p /tmp/verify
             unzip -q "dist/${name}" -d /tmp/verify
             lib="/tmp/verify/${entry}"
-            go version -m "${lib}" >/dev/null 2>&1 || {
+            meta="$(go version -m "${lib}" 2>/dev/null)" || {
               echo "${name}: ${entry} is not a readable Go binary"; exit 1; }
-            case "${platform}" in
-              darwin_amd64|linux_amd64|windows_amd64)
-                file -b "${lib}" | grep -q 'x86-64\|x86_64' || {
-                  echo "${name}: want x86-64, got: $(file -b "${lib}")"; exit 1; } ;;
-              darwin_arm64|linux_arm64|windows_arm64)
-                file -b "${lib}" | grep -q 'arm64\|aarch64\|ARM64' || {
-                  echo "${name}: want arm64, got: $(file -b "${lib}")"; exit 1; } ;;
+            goos="${platform%_*}"; goarch="${platform##*_}"
+            got_goos="$(printf '%s\n' "${meta}" | sed -n 's/.*GOOS=\([a-z0-9]*\).*/\1/p' | head -1)"
+            got_goarch="$(printf '%s\n' "${meta}" | sed -n 's/.*GOARCH=\([a-z0-9]*\).*/\1/p' | head -1)"
+            test "${got_goos}" = "${goos}" || {
+              echo "${name}: built for GOOS=${got_goos}, want ${goos}"; exit 1; }
+            test "${got_goarch}" = "${goarch}" || {
+              echo "${name}: built for GOARCH=${got_goarch}, want ${goarch}"; exit 1; }
+            case "${goarch}" in
+              amd64) want='x86-64\|x86_64' ;;
+              arm64) want='arm64\|aarch64' ;;
             esac
+            file -b "${lib}" | grep -qi "${want}" || {
+              echo "${name}: want ${goarch}, file says: $(file -b "${lib}")"; exit 1; }
           done
           echo "asset matrix complete"
 
