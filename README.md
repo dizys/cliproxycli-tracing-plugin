@@ -201,16 +201,17 @@ reported to the host log.
 Requires Go 1.24+ and a C compiler (cgo).
 
 ```sh
-./build.sh                     # -> cliproxy-tracing-v0.2.1.so (linux/amd64)
+./build.sh                     # -> cliproxy-tracing-v0.2.2.so (linux/amd64)
 ARCH=arm64 ./build.sh          # native arm64 build
 ./build-release.sh             # plugin-store artifacts in dist/
 ```
 
 `./build-release.sh` produces one zip per platform plus `checksums.txt`. All
-five store platforms are mandatory, so the script fails rather than skipping a
-platform whose compiler is missing. Tagging `v<version>` triggers the release
-workflow, which builds each platform on a matching runner and publishes only
-after the asset matrix check passes.
+six store platforms are mandatory (Darwin, Linux and Windows, each on amd64 and
+arm64), so the script fails rather than skipping a platform whose compiler is
+missing. Tagging `v<version>` triggers the release workflow, which builds each
+platform on a matching runner and publishes only after the asset matrix check
+passes, including an architecture check on every packaged library.
 
 ## Privacy
 

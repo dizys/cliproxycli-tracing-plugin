@@ -34,10 +34,11 @@ jobs:
       - name: Test
         run: go test ./...
 
-  # One library per platform, each built on a native runner. A c-shared library
-  # cannot be cross-compiled to Darwin without a macOS SDK, and the store
-  # requires all five platforms, so the matrix is the only honest way to
-  # produce them. Each job uploads one library; the package job assembles them.
+  # One library per platform, each built on a matching runner. A c-shared
+  # library cannot be cross-compiled to Darwin without a macOS SDK, and the
+  # store requires all six platforms (Darwin, Linux and Windows on amd64 and
+  # arm64), so the matrix is the only honest way to produce them. Each job
+  # uploads one library; the package job assembles them.
   build:
     needs: test
     strategy:
@@ -61,6 +62,13 @@ jobs:
           - target: windows/amd64
             dir: windows_amd64
             os: windows-2025
+          # No gcc targets aarch64-windows-gnu and the Windows runners ship no
+          # arm64 cross compiler, so this one builds on Linux with zig, which
+          # carries its own libc for the target. The result is a genuine
+          # PE32+ ARM64 DLL (machine 0xAA64), not a relabelled x64 binary.
+          - target: windows/arm64
+            dir: windows_arm64
+            os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -85,6 +93,27 @@ jobs:
           C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc zip"
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install cross compiler (windows/arm64)
+        if: matrix.target == 'windows/arm64'
+        run: |
+          set -euo pipefail
+          # zig is downloaded to a fixed path rather than installed through a
+          # package manager: version and checksum are then pinned here, and the
+          # job does not depend on whatever mirror apt happens to resolve.
+          zig_version=0.13.0
+          zig_dir="/opt/zig-${zig_version}"
+          curl -sSfL -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/${zig_version}/zig-linux-x86_64-${zig_version}.tar.xz"
+          sudo mkdir -p "${zig_dir}"
+          sudo tar -C "${zig_dir}" --strip-components=1 -xJf /tmp/zig.tar.xz
+          "${zig_dir}/zig" version
+          # build-release.sh probes for `zigcc` on PATH, so the wrapper is the
+          # contract between the workflow and the script.
+          printf '#!/bin/sh\nexec %s/zig cc -target aarch64-windows-gnu "$@"\n' "${zig_dir}" \
+            | sudo tee /usr/local/bin/zigcc >/dev/null
+          sudo chmod +x /usr/local/bin/zigcc
+          zigcc --version | head -2
 
       - name: Build library
         run: VERSION="${RELEASE_VERSION#v}" TARGET="${{ matrix.target }}" ./build-release.sh
@@ -133,7 +162,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_VERSION#v}"
-          for platform in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64 windows_amd64; do
+          platforms="darwin_amd64 darwin_arm64 linux_amd64 linux_arm64 windows_amd64 windows_arm64"
+          count_want=6
+          count_have=$(ls dist/cliproxy-tracing_*.zip | wc -l)
+          test "${count_have}" -eq "${count_want}" || {
+            echo "packaged ${count_have} archives, want ${count_want}"; exit 1; }
+          for platform in ${platforms}; do
             name="cliproxy-tracing_${version}_${platform}.zip"
             test -f "dist/${name}" || { echo "missing dist/${name}"; exit 1; }
             grep -q "  ${name}$" dist/checksums.txt || { echo "missing checksum for ${name}"; exit 1; }
@@ -145,6 +179,23 @@ jobs:
             entry="$(unzip -Z1 "dist/${name}")"
             test "${entry}" = "cliproxy-tracing.${ext}" || {
               echo "${name} holds ${entry}, want cliproxy-tracing.${ext}"; exit 1; }
+            # A cross build can succeed and still emit the host architecture, so
+            # read the machine out of the binary itself. windows/arm64 is the
+            # one most likely to be wrong: mingw cannot target it, and only a
+            # real arm64 toolchain produces machine 0xAA64.
+            rm -rf /tmp/verify && mkdir -p /tmp/verify
+            unzip -q "dist/${name}" -d /tmp/verify
+            lib="/tmp/verify/${entry}"
+            go version -m "${lib}" >/dev/null 2>&1 || {
+              echo "${name}: ${entry} is not a readable Go binary"; exit 1; }
+            case "${platform}" in
+              darwin_amd64|linux_amd64|windows_amd64)
+                file -b "${lib}" | grep -q 'x86-64\|x86_64' || {
+                  echo "${name}: want x86-64, got: $(file -b "${lib}")"; exit 1; } ;;
+              darwin_arm64|linux_arm64|windows_arm64)
+                file -b "${lib}" | grep -q 'arm64\|aarch64\|ARM64' || {
+                  echo "${name}: want arm64, got: $(file -b "${lib}")"; exit 1; } ;;
+            esac
           done
           echo "asset matrix complete"
 

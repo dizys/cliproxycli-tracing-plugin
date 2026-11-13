@@ -48,7 +48,7 @@ func iconDataURI() string {
 }
 
 // pluginVersion is overridden at build time with -X main.pluginVersion=<version>.
-var pluginVersion = "0.2.1"
+var pluginVersion = "0.2.2"
 
 var plugin = newPluginInstance()
 

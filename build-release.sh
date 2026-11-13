@@ -5,15 +5,16 @@
 #
 #   cliproxy-tracing_<version>_<goos>_<goarch>.zip
 #
-# for darwin/amd64, darwin/arm64, linux/amd64, linux/arm64 and windows/amd64,
-# plus one sha256sum-format checksums.txt. Each archive holds the library at its
-# root under the name the store documents: cliproxy-tracing.<ext>.
+# for darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64 and
+# windows/arm64, plus one sha256sum-format checksums.txt. Each archive holds the
+# library at its root under the name the store documents: cliproxy-tracing.<ext>.
 #
 # Every required platform is mandatory. A missing toolchain is an error, never a
 # silent skip: a release that quietly drops a platform is exactly the failure
 # this script exists to prevent. Build darwin targets on macOS (there is no
-# portable cross toolchain for them), windows on Windows or with mingw, and
-# linux/arm64 with aarch64-linux-gnu-gcc.
+# portable cross toolchain for them), windows/amd64 on Windows or with mingw,
+# linux/arm64 with aarch64-linux-gnu-gcc, and windows/arm64 with zig, because
+# mingw only targets x86.
 #
 # Usage:
 #   ./build-release.sh                    build every platform, then package
@@ -21,7 +22,7 @@
 #   ./build-release.sh --package          package the libraries already built
 #
 # Environment:
-#   VERSION   release version without the leading v (default: 0.2.1)
+#   VERSION   release version without the leading v (default: 0.2.2)
 #   OUT_DIR   output directory (default: dist)
 #   CC_<goos>_<goarch>   override the compiler for one platform, for example
 #                        CC_linux_arm64=aarch64-linux-gnu-gcc
@@ -30,7 +31,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PLUGIN_ID="cliproxy-tracing"
-VERSION="${VERSION:-0.2.1}"
+VERSION="${VERSION:-0.2.2}"
 VERSION="${VERSION#v}"
 OUT_DIR="${OUT_DIR:-dist}"
 LIB_DIR="${OUT_DIR}/lib"
@@ -41,6 +42,7 @@ PLATFORMS=(
     linux/amd64
     linux/arm64
     windows/amd64
+    windows/arm64
 )
 
 lib_ext() {
@@ -82,6 +84,10 @@ cc_candidates() {
     case "${goos}/${goarch}" in
         linux/arm64) echo "aarch64-linux-gnu-gcc" ;;
         windows/amd64) echo "x86_64-w64-mingw32-gcc" ;;
+        # No gcc targets aarch64-windows-gnu; zig ships its own libc for the
+        # target and speaks the mingw ABI. zigcc is a small wrapper the release
+        # workflow installs around `zig cc -target aarch64-windows-gnu`.
+        windows/arm64) echo "aarch64-w64-mingw32-gcc zigcc" ;;
         darwin/*) echo "clang" ;;
         *) echo "" ;;
     esac
