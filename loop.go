@@ -278,10 +278,46 @@ func encodeBatch(cfg config, spans []otlpSpan) otlpRequest {
 	}
 }
 
-// flushNow runs one flush synchronously, used on quiesce so a shutdown does not
-// lose the traces already assembled.
+// flushNow drains everything and exports it, ignoring the grace window. This is
+// the last-chance path on quiesce and shutdown: a trace inside its grace window
+// would otherwise be discarded, because the loop that would have released it is
+// about to stop.
 func (p *pluginInstance) flushNow() {
+	p.releaseHeld(true)
 	p.flushOnce(context.Background())
+}
+
+// releaseHeld moves traces still inside their grace window into the ready set,
+// or drops them when force is false and they have not expired yet.
+func (p *pluginInstance) releaseHeld(force bool) {
+	if !force {
+		return
+	}
+	p.mu.Lock()
+	if len(p.held) == 0 {
+		p.mu.Unlock()
+		return
+	}
+	pending := p.held
+	p.held = nil
+	p.mu.Unlock()
+
+	for _, h := range pending {
+		for _, tr := range h.traces {
+			p.exportTrace(context.Background(), tr)
+		}
+	}
+}
+
+// exportTrace builds and sends one trace immediately, outside the batch budget.
+func (p *pluginInstance) exportTrace(ctx context.Context, tr *finishedTrace) {
+	cfg := p.config.get()
+	if !cfg.active() {
+		return
+	}
+	for _, batch := range splitBatches(cfg, buildTraceSpans(tr, cfg, time.Now())) {
+		p.sendBatch(ctx, cfg, batch)
+	}
 }
 
 func (p *pluginInstance) shutdown() {

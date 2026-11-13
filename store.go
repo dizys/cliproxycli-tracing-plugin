@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"sort"
 	"sync"
 	"time"
@@ -47,6 +46,9 @@ type pending struct {
 	model          string
 	requestedModel string
 	stream         bool
+	// sessionID is set when a hook reports one, so a trace whose usage records
+	// are late still carries the conversation grouping.
+	sessionID string
 
 	// promptJSON is the client's request body, verbatim.
 	promptJSON []byte
@@ -56,8 +58,16 @@ type pending struct {
 	// can be distinguished from an empty one.
 	promptSource string
 
-	// completion accumulates streamed delta text or the whole non-stream body.
-	completion          []byte
+	// completion accumulates streamed content, or the parts of a non-streaming
+	// response. The two are kept apart because a stream has no content array
+	// and has to be reassembled from fragments.
+	text      []byte
+	reasoning []byte
+	tools     []streamTool
+
+	// completionParts holds a non-streaming response's parts verbatim.
+	completionParts []part
+
 	completionTruncated bool
 	completionSource    string
 
@@ -68,6 +78,19 @@ type pending struct {
 
 	startedAt time.Time
 	updatedAt time.Time
+}
+
+// streamTool is one tool call being assembled from stream fragments. The host
+// delivers a name and id either on the first fragment (OpenAI) or in a separate
+// block-start event (Anthropic), and the arguments as fragments after that.
+type streamTool struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
+	// started records that a block-start named this call, so a later fragment
+	// with a matching name is not mistaken for a second call.
+	started bool
 }
 
 // store holds in-flight requests and finished traces waiting to be exported.
@@ -102,10 +125,14 @@ type finishedTrace struct {
 	PromptJSON          []byte
 	PromptTruncated     bool
 	PromptSource        string
-	Completion          []byte
+	Completion          []part
 	CompletionTruncated bool
 	CompletionSource    string
 	Chunks              int
+
+	// SessionID is the host's session identity for this request, used to group
+	// traces into a conversation in the backend.
+	SessionID string
 
 	// Attempts are the usage records for this trace, in arrival order.
 	Attempts []usageRecord
@@ -194,31 +221,142 @@ func (p *pending) setPrompt(body []byte, source string) {
 	p.promptJSON = append([]byte(nil), body...)
 }
 
-// appendCompletion adds streamed delta text or a whole response body.
-func (p *pending) appendCompletion(text []byte, source string) {
-	if len(text) == 0 {
+// appendDelta adds one chunk's content to the assembled completion. It is
+// called once per chunk on the request path, so it only appends.
+func (p *pending) appendDelta(d streamDelta, source string) {
+	if d.empty() {
 		return
 	}
 	if p.completionSource == "" {
 		p.completionSource = source
 	}
-	p.completionBytesRaw += len(text)
-	remaining := maxStoredCompletionBytes - len(p.completion)
-	if remaining <= 0 {
-		p.completionTruncated = true
-		return
+	p.chunks++
+	p.completionBytesRaw += len(d.Text) + len(d.Reasoning)
+	if d.Text != "" {
+		p.text = appendCappedBytes(p, p.text, d.Text)
 	}
-	if len(text) > remaining {
-		p.completion = append(p.completion, text[:remaining]...)
-		p.completionTruncated = true
-		return
+	if d.Reasoning != "" {
+		p.reasoning = appendCappedBytes(p, p.reasoning, d.Reasoning)
 	}
-	p.completion = append(p.completion, text...)
+	for _, fragment := range d.ToolCalls {
+		p.completionBytesRaw += len(fragment.Arguments)
+		p.mergeTool(fragment)
+	}
 }
 
-// appendTo adds completed delta text to a pending request, creating one if the
+// appendCappedBytes appends up to the completion budget, flagging truncation
+// on the chunk that overflowed it.
+//
+// This appends into a byte slice rather than concatenating strings. String
+// concatenation allocates a fresh copy every call, which for a long stream is
+// quadratic in the answer length and dominated the per-chunk cost.
+func appendCappedBytes(p *pending, dst []byte, src string) []byte {
+	remaining := maxStoredCompletionBytes - len(dst)
+	if remaining <= 0 {
+		p.completionTruncated = true
+		return dst
+	}
+	if len(src) > remaining {
+		p.completionTruncated = true
+		return append(dst, src[:remaining]...)
+	}
+	return append(dst, src...)
+}
+
+// mergeTool joins one fragment into the tool call it belongs to.
+//
+// Two dialects deliver calls differently. OpenAI tags every fragment with an
+// index, so the index is authoritative. Anthropic announces the call once with
+// its id and name and then streams argument fragments with neither, so a
+// fragment carrying a name or id and no index opens a new call, and a bare
+// argument fragment attaches to the most recent one.
+func (p *pending) mergeTool(fragment toolCallDelta) {
+	// An indexed fragment addresses its call directly. This is the OpenAI
+	// shape, where parallel calls interleave by index.
+	if fragment.HasIndex {
+		for len(p.tools) <= fragment.Index {
+			p.tools = append(p.tools, streamTool{Index: len(p.tools)})
+		}
+		t := &p.tools[fragment.Index]
+		t.started = true
+		if fragment.ID != "" && t.ID == "" {
+			t.ID = fragment.ID
+		}
+		if fragment.Name != "" && t.Name == "" {
+			t.Name = fragment.Name
+		}
+		p.appendToolArguments(t, fragment.Arguments)
+		return
+	}
+
+	if fragment.Name != "" || fragment.ID != "" {
+		// A fragment that names a call opens one, unless it is the same call
+		// already open at that index.
+		if len(p.tools) > fragment.Index && p.tools[fragment.Index].started {
+			t := &p.tools[fragment.Index]
+			if fragment.ID != "" && t.ID == "" {
+				t.ID = fragment.ID
+			}
+			if fragment.Name != "" && t.Name == "" {
+				t.Name = fragment.Name
+			}
+			p.appendToolArguments(t, fragment.Arguments)
+			return
+		}
+		t := streamTool{Index: len(p.tools), ID: fragment.ID, Name: fragment.Name, started: true}
+		p.appendToolArguments(&t, fragment.Arguments)
+		p.tools = append(p.tools, t)
+		return
+	}
+
+	// A bare argument fragment belongs to the open call.
+	if fragment.Arguments == "" {
+		return
+	}
+	if len(p.tools) == 0 {
+		// Arguments with no announcement: keep them so nothing is lost.
+		t := streamTool{Index: 0}
+		p.appendToolArguments(&t, fragment.Arguments)
+		p.tools = append(p.tools, t)
+		return
+	}
+	p.appendToolArguments(&p.tools[len(p.tools)-1], fragment.Arguments)
+}
+
+func (p *pending) appendToolArguments(t *streamTool, args string) {
+	if args == "" {
+		return
+	}
+	if len(t.Arguments)+len(args) > maxStoredCompletionBytes {
+		p.completionTruncated = true
+		return
+	}
+	t.Arguments += args
+}
+
+// setCompletionParts stores a non-streaming response's parts.
+func (p *pending) setCompletionParts(parts []part, source string) {
+	if len(parts) == 0 {
+		return
+	}
+	if p.completionSource == "" {
+		p.completionSource = source
+	}
+	p.completionParts = parts
+}
+
+// completionSnapshot returns the parts of the assembled completion, whether it
+// arrived streamed or whole.
+func (p *pending) completionSnapshot() []part {
+	if len(p.completionParts) > 0 {
+		return p.completionParts
+	}
+	return streamParts(string(p.text), string(p.reasoning), p.tools)
+}
+
+// appendTo adds one chunk's content to a pending request, creating one if the
 // header-init call was missed.
-func (s *store) appendTo(key string, now time.Time, text string, source string) {
+func (s *store) appendTo(key string, now time.Time, d streamDelta, source string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p, ok := s.pending[key]
@@ -230,8 +368,7 @@ func (s *store) appendTo(key string, now time.Time, text string, source string) 
 		s.pending[key] = p
 	}
 	p.updatedAt = now
-	p.chunks++
-	p.appendCompletion([]byte(text), source)
+	p.appendDelta(d, source)
 }
 
 // discard drops a pending request without exporting it, used when sampling or
@@ -260,6 +397,17 @@ func (s *store) finish(key string, now time.Time, c requestCompletion, attempts 
 	if p.traceID != "" {
 		delete(s.traceIndex, p.traceID)
 	}
+	// The session id arrives on the usage record rather than on the hooks, so it
+	// is taken from the attempts. It groups traces into a conversation.
+	sessionID := p.sessionID
+	if sessionID == "" {
+		for i := range attempts {
+			if attempts[i].SessionID != "" {
+				sessionID = attempts[i].SessionID
+				break
+			}
+		}
+	}
 	tr := &finishedTrace{
 		TraceID:             firstNonEmpty(c.TraceID, p.traceID),
 		RequestID:           firstNonEmpty(c.RequestID, p.requestID),
@@ -275,10 +423,11 @@ func (s *store) finish(key string, now time.Time, c requestCompletion, attempts 
 		PromptJSON:          p.promptJSON,
 		PromptTruncated:     p.promptTruncated,
 		PromptSource:        p.promptSource,
-		Completion:          p.completion,
+		Completion:          p.completionSnapshot(),
 		CompletionTruncated: p.completionTruncated,
 		CompletionSource:    p.completionSource,
 		Chunks:              p.chunks,
+		SessionID:           sessionID,
 		Attempts:            attempts,
 	}
 	if tr.StartedAt.IsZero() {
@@ -326,143 +475,6 @@ func (s *store) stats() (pendingCount int, dropped uint64) {
 	return len(s.pending), s.dropped
 }
 
-// parsePromptMessages turns the stored client body into the message list every
-// backend understands. This runs on the exporter goroutine, never inline.
-//
-// The body shape differs by protocol, so this accepts the common shapes rather
-// than assuming one: OpenAI chat/completions uses "messages", the Responses API
-// uses "input" (a string or an array), and Anthropic uses "messages" with a
-// separate "system" string. Anything unrecognised is kept as a single raw
-// message so no content is silently lost.
-func parsePromptMessages(body []byte) []chatMessage {
-	if len(body) == 0 {
-		return nil
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return []chatMessage{{Role: "user", Content: string(body)}}
-	}
-
-	var out []chatMessage
-	if system := stringField(doc, "system"); system != "" {
-		out = append(out, chatMessage{Role: "system", Content: system})
-	}
-	if msgs, ok := doc["messages"].([]any); ok {
-		for _, item := range msgs {
-			if m, ok := item.(map[string]any); ok {
-				out = append(out, chatMessage{
-					Role:    stringField(m, "role"),
-					Content: contentToString(m["content"]),
-				})
-			}
-		}
-	}
-	if len(out) == 0 {
-		switch input := doc["input"].(type) {
-		case string:
-			if input != "" {
-				out = append(out, chatMessage{Role: "user", Content: input})
-			}
-		case []any:
-			for _, item := range input {
-				if m, ok := item.(map[string]any); ok {
-					out = append(out, chatMessage{
-						Role:    stringField(m, "role"),
-						Content: contentToString(m["content"]),
-					})
-				}
-			}
-		}
-	}
-	if len(out) == 0 {
-		if prompt := stringField(doc, "prompt"); prompt != "" {
-			out = append(out, chatMessage{Role: "user", Content: prompt})
-		}
-	}
-	if len(out) == 0 {
-		// Preserve the payload rather than dropping it.
-		out = append(out, chatMessage{Role: "user", Content: string(body)})
-	}
-	for i := range out {
-		if out[i].Role == "" {
-			out[i].Role = "user"
-		}
-	}
-	return out
-}
-
-// contentToString flattens a message content field into text. Providers allow
-// either a string or an array of typed parts, and an agent transcript is
-// mostly the typed ones: tool_use carries the arguments the model emitted,
-// tool_result carries what the tool returned, and thinking carries reasoning.
-// All three are preserved verbatim as JSON rather than replaced with a label,
-// because they are the substance of an agent conversation.
-func contentToString(v any) string {
-	switch typed := v.(type) {
-	case nil:
-		return ""
-	case string:
-		return typed
-	case []any:
-		out := make([]byte, 0, 256)
-		for i, part := range typed {
-			if i > 0 {
-				out = append(out, '\n')
-			}
-			out = append(out, partToString(part)...)
-		}
-		return string(out)
-	default:
-		// Numbers, bools and objects that are not message parts.
-		if raw, err := json.Marshal(typed); err == nil {
-			return string(raw)
-		}
-		return ""
-	}
-}
-
-// partToString renders one content part, keeping its payload. A text part is
-// its text; anything else keeps every field except the redundant type, which
-// is re-emitted as a prefix so the shape is still readable line by line.
-func partToString(part any) string {
-	if s, ok := part.(string); ok {
-		return s
-	}
-	m, ok := part.(map[string]any)
-	if !ok {
-		if raw, err := json.Marshal(part); err == nil {
-			return string(raw)
-		}
-		return ""
-	}
-
-	typ := stringField(m, "type")
-
-	// A plain text part: keep the text alone.
-	if text, ok := m["text"].(string); ok && typ == "text" {
-		return text
-	}
-
-	// Everything else keeps its structure. The type is dropped from the body
-	// because it is already the prefix, and any text field is folded back in
-	// so nothing is lost.
-	payload := make(map[string]any, len(m))
-	for k, v := range m {
-		if k == "type" {
-			continue
-		}
-		payload[k] = v
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil || len(raw) == 0 {
-		return "[" + typ + "]"
-	}
-	if typ == "" {
-		return string(raw)
-	}
-	return "[" + typ + "] " + string(raw)
-}
-
 func stringField(doc map[string]any, key string) string {
 	if v, ok := doc[key].(string); ok {
 		return v
@@ -487,10 +499,4 @@ func sortedKeys[T any](m map[string]T) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// chatMessage is the neutral message shape both PostHog and Langfuse read.
-type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
 }

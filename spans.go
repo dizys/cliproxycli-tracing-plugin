@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -135,6 +134,13 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 		root.integer("http.response.status_code", int64(tr.StatusCode))
 	}
 
+	// A session groups traces into one conversation in the backend. PostHog
+	// reads gen_ai.conversation.id and maps it to $ai_session_id; a custom key
+	// would be stored but never grouped on, so the semconv name is used here
+	// rather than cpa.session_id alone.
+	root.str("cpa.session_id", tr.SessionID)
+	root.str("gen_ai.conversation.id", tr.SessionID)
+
 	rootSpan := otlpSpan{
 		TraceID:           tid,
 		SpanID:            rootID,
@@ -183,7 +189,11 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 		a.nonZero("cpa.usage.total_input_tokens", u.Detail.TotalTokens)
 		a.str("cpa.provider", u.Provider)
 		a.str("cpa.auth_type", u.AuthType)
-		a.str("cpa.session_id", u.SessionID)
+		a.str("cpa.session_id", tr.SessionID)
+		// The session id is repeated on the attempt span because that is the
+		// generation in both backends, and either span may be the one a
+		// consumer reads.
+		a.str("gen_ai.conversation.id", tr.SessionID)
 		if u.TTFT > 0 {
 			a.integer("cpa.ttft_ms", u.TTFT.Milliseconds())
 		}
@@ -227,56 +237,48 @@ func buildTraceSpans(tr *finishedTrace, cfg config, now time.Time) []otlpSpan {
 	return spans
 }
 
-// addContentAttrs attaches the conversation to a span in every dialect the
-// supported backends read.
+// addContentAttrs attaches the conversation to a span.
 //
 // Content is emitted once per trace, not once per span. A request with three
 // upstream attempts would otherwise carry the same multi-hundred-kilobyte
 // conversation four times, which is how a batch reaches a backend's body limit.
 // The attempt span is the generation for both PostHog and Langfuse, so content
-// belongs there; the root keeps only the provenance flags.
+// belongs there.
+//
+// The message shape is the OTel GenAI semconv `parts` form, which PostHog
+// renders and whose tool-call extractor reads. A flat `content` string is not
+// sent: it renders as prose but is invisible to extraction, so tool calls would
+// not appear in the Tools view and their arguments would become unparseable
+// text.
 func addContentAttrs(a *attrs, tr *finishedTrace, cfg config) {
-	prompt := trimPrompt(parsePromptMessages(tr.PromptJSON), cfg)
-	out := completionMessages(tr, cfg)
+	prompt := trimPrompt(promptMessages(tr.PromptJSON), cfg)
+	out := trimCompletion(tr.Completion, cfg)
 
-	if len(prompt) > 0 {
-		if raw, err := json.Marshal(trimMessages(prompt, cfg)); err == nil {
-			text := string(raw)
-			// PostHog: gen_ai.input.messages -> $ai_input.
-			a.str("gen_ai.input.messages", text)
-			// Langfuse native, which takes precedence over the generic form.
-			a.str("langfuse.observation.input", text)
-		}
+	if in := messagesJSON(prompt); in != "" {
+		// PostHog: gen_ai.input.messages -> $ai_input.
+		a.str("gen_ai.input.messages", in)
+		// Langfuse native, which takes precedence over the generic form.
+		a.str("langfuse.observation.input", in)
 	}
 	if len(out) > 0 {
-		if raw, err := json.Marshal(out); err == nil {
-			text := string(raw)
-			a.str("gen_ai.output.messages", text)
-			a.str("langfuse.observation.output", text)
+		if encoded := messagesJSON([]chatMessage{{Role: "assistant", Parts: out}}); encoded != "" {
+			a.str("gen_ai.output.messages", encoded)
+			a.str("langfuse.observation.output", encoded)
 		}
 	}
 	if len(prompt) > 0 {
 		// Langfuse's generic convention reads these; harmless for PostHog.
-		var b strings.Builder
-		for i, m := range prompt {
-			if i > 0 {
-				b.WriteString("\n\n")
-			}
-			b.WriteString(m.Role)
-			b.WriteString(": ")
-			b.WriteString(m.Content)
-		}
-		a.str("gen_ai.prompt", b.String())
+		a.str("gen_ai.prompt", renderMessages(prompt))
 	}
 	if len(out) > 0 {
-		var b strings.Builder
-		for i, m := range out {
-			if i > 0 {
-				b.WriteString("\n\n")
-			}
-			b.WriteString(m.Content)
+		a.str("gen_ai.completion", renderParts(out))
+	}
+	// The declared tool catalog, which PostHog maps to $ai_tools. This is what
+	// the Tools view needs to tell a call it saw from one it never could make.
+	if defs := toolDefinitions(tr.PromptJSON); len(defs) > 0 {
+		if len(defs) <= cfg.MaxTraceContentBytes {
+			a.str("gen_ai.tool.definitions", string(defs))
 		}
-		a.str("gen_ai.completion", b.String())
 	}
 
 	// Provenance, so a consumer can tell a truncated capture from a short one.
@@ -287,74 +289,152 @@ func addContentAttrs(a *attrs, tr *finishedTrace, cfg config) {
 	a.nonZero("cpa.content.chunks", int64(tr.Chunks))
 }
 
-// completionMessages shapes the captured completion as an assistant message.
-func completionMessages(tr *finishedTrace, cfg config) []chatMessage {
-	if len(tr.Completion) == 0 {
+// trimCompletion clips the completion to the per-trace budget.
+func trimCompletion(parts []part, cfg config) []part {
+	if len(parts) == 0 {
 		return nil
 	}
-	text := string(tr.Completion)
-	if cap := cfg.MaxTraceContentBytes; cap > 0 && len(text) > cap {
-		text = text[:cap] + "\n...[truncated]"
+	cap := cfg.MaxTraceContentBytes
+	if cap <= 0 || !overBudget(parts, cap) {
+		return clampParts(parts, cfg.MaxContentChars)
 	}
-	return []chatMessage{{Role: "assistant", Content: text}}
+	// Mark the one part that was actually shortened, so a consumer can tell a
+	// clipped completion from a complete one.
+	out := make([]part, len(parts))
+	copy(out, parts)
+	remaining := cap
+	for i := range out {
+		n := len(out[i].Content) + len(out[i].Arguments) + len(out[i].Response)
+		if remaining < n {
+			out[i].Content = truncateText(out[i].Content, remaining) + "\n...[truncated]"
+			for j := i + 1; j < len(out); j++ {
+				out[j] = part{Type: out[j].Type, Content: "...[truncated]"}
+			}
+			break
+		}
+		remaining -= n
+	}
+	return clampParts(out, cfg.MaxContentChars)
 }
 
-// trimPrompt applies the per-trace content cap, then the per-message cap.
+func overBudget(parts []part, cap int) bool {
+	n := 0
+	for _, p := range parts {
+		n += len(p.Content) + len(p.Arguments) + len(p.Response)
+		if n > cap {
+			return true
+		}
+	}
+	return false
+}
+
+// clampParts applies the per-part character cap so one huge block does not
+// dominate an attribute.
+func clampParts(parts []part, limit int) []part {
+	if limit <= 0 {
+		return parts
+	}
+	out := make([]part, len(parts))
+	for i, p := range parts {
+		if len(p.Content) > limit {
+			p.Content = p.Content[:limit] + "...[truncated]"
+		}
+		out[i] = p
+	}
+	return out
+}
+
+// renderMessages flattens messages to a `role: text` transcript, which is the
+// shape Langfuse's generic attributes expect.
+func renderMessages(msgs []chatMessage) string {
+	var b strings.Builder
+	for i, m := range msgs {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(m.Role)
+		b.WriteString(": ")
+		b.WriteString(renderParts(m.Parts))
+	}
+	return b.String()
+}
+
+// renderParts flattens parts to plain text for the generic attributes.
+func renderParts(parts []part) string {
+	var b strings.Builder
+	for i, p := range parts {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(partToText(p))
+	}
+	return b.String()
+}
+
+// trimPrompt applies the per-trace content cap, then the per-part cap.
 //
 // A long agent conversation is over the backend's body limit long before it is
-// over any per-message limit: twenty turns of tool traffic at 40 KiB each is
+// over any per-part limit: twenty turns of tool traffic at 40 KiB each is
 // 800 KiB in one span. The oldest messages are dropped rather than the newest,
-// because the most recent turns are the ones that describe the exchange being
-// traced, and the removal is marked so a consumer can tell a short conversation
-// from a clipped one.
+// because the most recent turns describe the exchange being traced, and the
+// removal is marked so a consumer can tell a short conversation from a clipped
+// one.
 func trimPrompt(msgs []chatMessage, cfg config) []chatMessage {
 	cap := cfg.MaxTraceContentBytes
 	if cap <= 0 || len(msgs) == 0 {
-		return trimMessages(msgs, cfg)
+		return clampMessages(msgs, cfg.MaxContentChars)
+	}
+
+	size := func(m chatMessage) int {
+		n := 0
+		for _, p := range m.Parts {
+			n += len(p.Content) + len(p.Arguments) + len(p.Response)
+		}
+		return n
 	}
 
 	total := 0
 	for _, m := range msgs {
-		total += len(m.Content)
+		total += size(m)
 	}
 	// Keep the tail: drop from the front until it fits, always leaving the
 	// newest message.
 	drop := 0
 	for total > cap && drop < len(msgs)-1 {
-		total -= len(msgs[drop].Content)
+		total -= size(msgs[drop])
 		drop++
 	}
 	if drop > 0 {
 		msgs = msgs[drop:]
 		// Say that a prefix was removed, so the first remaining turn is not
 		// mistaken for the start of the conversation.
-		msgs[0] = chatMessage{Role: msgs[0].Role, Content: "...[earlier messages omitted]\n" + msgs[0].Content}
+		marker := part{Type: partText, Content: omitEarlierMessages}
+		msgs[0].Parts = append([]part{marker}, msgs[0].Parts...)
 		total = 0
 		for _, m := range msgs {
-			total += len(m.Content)
+			total += size(m)
 		}
 	}
 	// One message can still be over the cap on its own, usually a pasted file.
 	// Left alone it would make a span larger than the budget, so it is clipped.
 	if total > cap && len(msgs) == 1 {
-		msgs[0].Content = truncateText(msgs[0].Content, cap)
+		for i := range msgs[0].Parts {
+			if len(msgs[0].Parts[i].Content) > cap {
+				msgs[0].Parts[i].Content = truncateText(msgs[0].Parts[i].Content, cap)
+			}
+		}
 	}
-	return trimMessages(msgs, cfg)
+	return clampMessages(msgs, cfg.MaxContentChars)
 }
 
-// trimMessages applies the configured per-content cap so a huge prompt does not
-// turn into a multi-megabyte attribute. Truncation is signalled separately.
-func trimMessages(msgs []chatMessage, cfg config) []chatMessage {
-	if cfg.MaxContentChars <= 0 {
+// clampMessages applies the per-part character cap.
+func clampMessages(msgs []chatMessage, limit int) []chatMessage {
+	if limit <= 0 {
 		return msgs
 	}
 	out := make([]chatMessage, len(msgs))
 	for i, m := range msgs {
-		if len(m.Content) > cfg.MaxContentChars {
-			out[i] = chatMessage{Role: m.Role, Content: m.Content[:cfg.MaxContentChars] + "...[truncated]"}
-			continue
-		}
-		out[i] = m
+		out[i] = chatMessage{Role: m.Role, Parts: clampParts(m.Parts, limit)}
 	}
 	return out
 }

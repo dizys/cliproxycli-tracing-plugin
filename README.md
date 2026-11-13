@@ -32,9 +32,36 @@ backend with no per-backend configuration:
 | Generation marker | `gen_ai.operation.name` = `chat`, `langfuse.observation.type` |
 | Prompt | `gen_ai.input.messages`, `langfuse.observation.input`, `gen_ai.prompt` |
 | Completion | `gen_ai.output.messages`, `langfuse.observation.output`, `gen_ai.completion` |
+| Tool catalog | `gen_ai.tool.definitions` |
+| Session | `gen_ai.conversation.id` |
 | Tokens | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, cached, reasoning |
 | Models | `gen_ai.request.model`, `gen_ai.response.model` |
 | Provenance | `cpa.content.prompt_source`, `cpa.content.completion_source`, `cpa.content.*_truncated` |
+
+### Sessions and tool calls
+
+`gen_ai.conversation.id` carries CLIProxyAPI's session identity, which groups
+traces into one conversation in PostHog. The host derives that identity from the
+client's session headers (`X-Claude-Code-Session-Id`, `Session-Id`,
+`Thread-Id`, and others), so Claude Code and Codex sessions group automatically
+without any client change.
+
+Messages use the OTel GenAI `parts` shape rather than a flat `content` string:
+
+```json
+{"role":"assistant","parts":[
+  {"type":"text","content":"Let me look."},
+  {"type":"tool_call","id":"toolu_1","name":"read_file","arguments":{"path":"/etc/hosts"}},
+  {"type":"reasoning","content":"The path is explicit."}]}
+```
+
+This is what makes tool calls appear in PostHog's Tools view. A flat string
+renders as prose but is invisible to PostHog's tool-call extractor, so arguments
+end up as unparseable text and the tool never reaches the Tools tab. Streamed
+tool calls are reassembled from their argument fragments first, so a streamed
+and a non-streamed call produce the same part. `gen_ai.tool.definitions` carries
+the declared catalog from the request's `tools`, which is what lets the Tools
+view distinguish a call it saw from one the agent could never have made.
 
 ## Setup
 
@@ -115,11 +142,12 @@ credential pasted into a prompt leaves the machine with it. Scrub before export
 if that matters for your deployment.
 
 Every part of an agent conversation is kept, not just assistant prose. A
-`tool_use` block keeps its tool name and arguments, a `tool_result` keeps the
-tool's output, and `thinking` blocks keep their text, on both the streaming and
-non-streaming paths and for both tool-call dialects. Streamed tool arguments
-arrive as fragments and are joined in order. Plain text parts are exported as
-their text alone, with no type prefix.
+`tool_use` block becomes a `tool_call` part with its name and arguments, a
+`tool_result` becomes a `tool_call_response` part correlated by id, and
+`thinking` becomes a `reasoning` part, on both the streaming and non-streaming
+paths and for every provider dialect. Streamed tool arguments arrive as
+fragments and are joined in order. Plain text parts are exported as their text
+alone, with no type prefix.
 
 Three limits apply. Content above `max_content_chars` per message is truncated
 with a marker. A prompt or completion above `max_trace_content_bytes` is clipped
@@ -173,7 +201,7 @@ reported to the host log.
 Requires Go 1.24+ and a C compiler (cgo).
 
 ```sh
-./build.sh                     # -> cliproxy-tracing-v0.1.3.so (linux/amd64)
+./build.sh                     # -> cliproxy-tracing-v0.2.0.so (linux/amd64)
 ARCH=arm64 ./build.sh          # native arm64 build
 ./build-release.sh             # plugin-store artifacts in dist/
 ```

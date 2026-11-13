@@ -7,7 +7,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VERSION="${VERSION:-0.1.3}"
+VERSION="${VERSION:-0.2.0}"
 ARCH="${ARCH:-amd64}"
 OUT="cliproxy-tracing-v${VERSION}.so"
 

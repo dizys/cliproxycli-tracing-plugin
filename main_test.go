@@ -32,7 +32,7 @@ func TestSpansCarryGenerationMarker(t *testing.T) {
 		TraceID: "trace-1", RequestID: "req-1", Outcome: "succeeded",
 		StartedAt: base, CompletedAt: base.Add(time.Second),
 		PromptJSON: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
-		Completion: []byte("hi there"),
+		Completion: []part{{Type: partText, Content: "hi there"}},
 		Attempts: []usageRecord{{
 			Provider: "claude", Model: "claude-opus-5-5",
 			RequestedAt: base, Latency: time.Second,
@@ -66,7 +66,7 @@ func TestSpansCarryContentForBothBackends(t *testing.T) {
 		TraceID: "trace-2", RequestID: "req-2", Outcome: "succeeded",
 		StartedAt: base, CompletedAt: base.Add(time.Second),
 		PromptJSON: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
-		Completion: []byte("hi there"),
+		Completion: []part{{Type: partText, Content: "hi there"}},
 		Attempts:   []usageRecord{{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second}},
 	}
 	spans := buildTraceSpans(tr, testConfig(), base)
@@ -103,7 +103,7 @@ func TestNoContentWhenCaptureDisabled(t *testing.T) {
 		TraceID: "trace-3", RequestID: "req-3", Outcome: "succeeded",
 		StartedAt: base, CompletedAt: base.Add(time.Second),
 		PromptJSON: []byte(`{"messages":[{"role":"user","content":"secret"}]}`),
-		Completion: []byte("secret answer"),
+		Completion: []part{{Type: partText, Content: "secret answer"}},
 		Attempts:   []usageRecord{{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second}},
 	}
 	spans := buildTraceSpans(tr, cfg, base)
@@ -120,6 +120,23 @@ func TestNoContentWhenCaptureDisabled(t *testing.T) {
 	}
 }
 
+// messagesText flattens a message list to text for assertions.
+func messagesText(msgs []chatMessage) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Role)
+		b.WriteString(": ")
+		for _, p := range m.Parts {
+			b.WriteString(p.Content)
+			b.WriteString(p.Name)
+			b.WriteString(string(p.Arguments))
+			b.WriteString(" ")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 func TestParsePromptMessageShapes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -132,13 +149,10 @@ func TestParsePromptMessageShapes(t *testing.T) {
 		{"responses array input", `{"input":[{"role":"user","content":"arr"}]}`, "arr"},
 		{"legacy prompt", `{"prompt":"legacy"}`, "legacy"},
 		{"parts array", `{"messages":[{"role":"user","content":[{"type":"text","text":"part text"}]}]}`, "part text"},
+		{"content key", `{"messages":[{"role":"user","content":[{"type":"text","content":"semconv"}]}]}`, "semconv"},
 	}
 	for _, tc := range cases {
-		msgs := parsePromptMessages([]byte(tc.body))
-		joined := ""
-		for _, m := range msgs {
-			joined += m.Content
-		}
+		joined := messagesText(promptMessages([]byte(tc.body)))
 		if !strings.Contains(joined, tc.want) {
 			t.Fatalf("%s: got %q, want it to contain %q", tc.name, joined, tc.want)
 		}
@@ -147,8 +161,8 @@ func TestParsePromptMessageShapes(t *testing.T) {
 
 // An unrecognised body must still be preserved rather than silently dropped.
 func TestParsePromptKeepsUnknownBody(t *testing.T) {
-	msgs := parsePromptMessages([]byte(`{"weird":true}`))
-	if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "weird") {
+	msgs := promptMessages([]byte(`{"weird":true}`))
+	if len(msgs) != 1 || !strings.Contains(messagesText(msgs), "weird") {
 		t.Fatalf("unrecognised body was dropped: %#v", msgs)
 	}
 }
@@ -168,7 +182,7 @@ func TestDeltaExtractionPerDialect(t *testing.T) {
 		{"done", `data: [DONE]`, ""},
 	}
 	for _, tc := range cases {
-		if got := extractDeltaText([]byte(tc.body)); got != tc.want {
+		if got := extractDelta([]byte(tc.body)).Text; got != tc.want {
 			t.Fatalf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
@@ -182,7 +196,7 @@ func TestCompletionExtractionPerDialect(t *testing.T) {
 		{"responses", `{"output":[{"content":[{"text":"resp"}]}]}`, "resp"},
 	}
 	for _, tc := range cases {
-		if got := extractCompletionText([]byte(tc.body)); got != tc.want {
+		if got := renderParts(completionParts([]byte(tc.body))); !strings.Contains(got, tc.want) {
 			t.Fatalf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
@@ -221,7 +235,7 @@ func TestCompleteRequestIsExported(t *testing.T) {
 		p.requestID = "req-y"
 		p.setPrompt([]byte(`{"messages":[{"role":"user","content":"q"}]}`), "request")
 	})
-	plugin.store.appendTo("req-y", base, "answer", "stream")
+	plugin.store.appendTo("req-y", base, streamDelta{Text: "answer"}, "stream")
 	_, _ = handleComplete(mustJSON(t, requestCompletion{
 		RequestID: "req-y", TraceID: "trace-y", Outcome: "succeeded",
 		StartedAt: base, CompletedAt: base.Add(time.Second),
@@ -231,8 +245,8 @@ func TestCompleteRequestIsExported(t *testing.T) {
 	if len(traces) != 1 {
 		t.Fatalf("got %d traces, want 1", len(traces))
 	}
-	if string(traces[0].Completion) != "answer" {
-		t.Fatalf("completion = %q", traces[0].Completion)
+	if got := renderParts(traces[0].Completion); got != "answer" {
+		t.Fatalf("completion = %q", got)
 	}
 }
 
@@ -253,12 +267,12 @@ func TestSamplingIsPerTrace(t *testing.T) {
 func TestContentTruncationIsRecorded(t *testing.T) {
 	p := &pending{}
 	big := strings.Repeat("x", maxStoredCompletionBytes+100)
-	p.appendCompletion([]byte(big), "stream")
+	p.appendDelta(streamDelta{Text: big}, "stream")
 	if !p.completionTruncated {
 		t.Fatal("oversized completion was not marked truncated")
 	}
-	if len(p.completion) != maxStoredCompletionBytes {
-		t.Fatalf("stored %d bytes, want %d", len(p.completion), maxStoredCompletionBytes)
+	if len(p.text) != maxStoredCompletionBytes {
+		t.Fatalf("stored %d bytes, want %d", len(p.text), maxStoredCompletionBytes)
 	}
 }
 
@@ -291,10 +305,34 @@ func TestConfigHeadersRejectControlChars(t *testing.T) {
 	}
 }
 
-// An agent transcript is mostly tool traffic. A tool_use carries the arguments
-// the model emitted and a tool_result carries what the tool returned; both were
-// previously replaced with a bare [tool_use] label, losing the payload.
-func TestToolCallPayloadsArePreserved(t *testing.T) {
+// PostHog's tool extractor reads `message.parts[]` for parts with type
+// tool_call and a name. This mirrors that walk so the assertion is against the
+// contract the backend actually implements, not our own shape.
+func posthogToolNames(msgs []chatMessage) []string {
+	var names []string
+	for _, m := range msgs {
+		for _, p := range m.Parts {
+			if p.Type == partToolCall && p.Name != "" {
+				names = append(names, p.Name)
+			}
+		}
+	}
+	return names
+}
+
+func findPart(parts []part, typ string) *part {
+	for i := range parts {
+		if parts[i].Type == typ {
+			return &parts[i]
+		}
+	}
+	return nil
+}
+
+// An agent transcript is mostly tool traffic. A tool call must become a
+// structured tool_call part: a flattened string renders as prose but is
+// invisible to PostHog's extractor, so it never reaches the Tools view.
+func TestToolCallsBecomeStructuredParts(t *testing.T) {
 	body := `{"messages":[
       {"role":"assistant","content":[
         {"type":"text","text":"Let me look."},
@@ -307,68 +345,170 @@ func TestToolCallPayloadsArePreserved(t *testing.T) {
         {"type":"thinking","thinking":"The file lists loopback."}
       ]}
     ]}`
-	msgs := parsePromptMessages([]byte(body))
-	all := ""
-	for _, m := range msgs {
-		all += m.Content + "\n"
+	msgs := promptMessages([]byte(body))
+
+	names := posthogToolNames(msgs)
+	if len(names) != 1 || names[0] != "read_file" {
+		t.Fatalf("tool names = %v, want [read_file]", names)
 	}
 
-	for _, want := range []string{"/etc/hosts", "read_file", "127.0.0.1 localhost", "The file lists loopback"} {
-		if !strings.Contains(all, want) {
-			t.Fatalf("tool payload %q was dropped; got:\n%s", want, all)
+	var call *part
+	for _, m := range msgs {
+		if p := findPart(m.Parts, partToolCall); p != nil {
+			call = p
 		}
 	}
-	if strings.Contains(all, "[tool_use]\n") || strings.TrimSpace(all) == "[tool_use]" {
-		t.Fatal("tool_use was replaced with a bare label")
+	if call == nil {
+		t.Fatal("no tool_call part")
+	}
+	if call.ID != "toolu_1" {
+		t.Fatalf("tool call id = %q", call.ID)
+	}
+	// The arguments must be the provider's object, not a quoted string, or a
+	// consumer has to parse twice.
+	if !strings.Contains(string(call.Arguments), `"/etc/hosts"`) {
+		t.Fatalf("tool arguments lost: %s", call.Arguments)
+	}
+
+	var result *part
+	for _, m := range msgs {
+		if p := findPart(m.Parts, partToolCallResp); p != nil {
+			result = p
+		}
+	}
+	if result == nil {
+		t.Fatal("no tool_call_response part")
+	}
+	if !strings.Contains(string(result.Response), "127.0.0.1 localhost") {
+		t.Fatalf("tool result lost: %s", result.Response)
+	}
+
+	var reasoning *part
+	for _, m := range msgs {
+		if p := findPart(m.Parts, partReasoning); p != nil {
+			reasoning = p
+		}
+	}
+	if reasoning == nil || !strings.Contains(reasoning.Content, "loopback") {
+		t.Fatalf("reasoning lost: %#v", reasoning)
+	}
+
+	// No part may be a bare label standing in for discarded content.
+	all := messagesText(msgs)
+	if strings.Contains(all, "[tool_use]") || strings.Contains(all, "[tool_result]") {
+		t.Fatalf("a part was labelled instead of kept: %s", all)
 	}
 }
 
-// Streamed tool calls arrive as name-then-argument-fragments with no text.
-func TestStreamedToolCallFragmentsArePreserved(t *testing.T) {
-	nameChunk := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`
-	argChunk := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}]}`
-
-	if got := extractDeltaText([]byte(nameChunk)); !strings.Contains(got, "get_weather") {
-		t.Fatalf("tool name dropped: %q", got)
+// A streamed tool call arrives as a name and then argument fragments, keyed by
+// index. It must be reassembled into one complete call, not left as fragments.
+func TestStreamedToolCallIsReassembled(t *testing.T) {
+	chunks := []string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]}}]}`,
 	}
-	if got := extractDeltaText([]byte(argChunk)); !strings.Contains(got, "Paris") {
-		t.Fatalf("tool arguments dropped: %q", got)
+	p := &pending{}
+	for _, chunk := range chunks {
+		d := extractDelta([]byte(chunk))
+		p.appendDelta(d, "stream")
+	}
+	parts := p.completionSnapshot()
+
+	if len(parts) != 1 {
+		t.Fatalf("got %d parts, want 1 tool call: %#v", len(parts), parts)
+	}
+	if parts[0].Type != partToolCall || parts[0].Name != "get_weather" {
+		t.Fatalf("part = %#v", parts[0])
+	}
+	if string(parts[0].Arguments) != `{"city":"Paris"}` {
+		t.Fatalf("arguments = %s, want joined JSON", parts[0].Arguments)
 	}
 }
 
-// Anthropic streams tool input and thinking as their own delta types.
-func TestAnthropicToolAndThinkingDeltas(t *testing.T) {
-	inputChunk := `data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}`
-	thinkingChunk := `data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}`
-
-	if got := extractDeltaText([]byte(inputChunk)); !strings.Contains(got, `"q":"x"`) {
-		t.Fatalf("tool input dropped: %q", got)
+// Anthropic streams tool input and reasoning as their own delta types.
+func TestAnthropicToolAndReasoningDeltas(t *testing.T) {
+	p := &pending{}
+	for _, chunk := range []string{
+		`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}`,
+		`data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}`,
+		`data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}`,
+	} {
+		p.appendDelta(extractDelta([]byte(chunk)), "stream")
 	}
-	if got := extractDeltaText([]byte(thinkingChunk)); !strings.Contains(got, "hmm") {
-		t.Fatalf("thinking dropped: %q", got)
+	parts := p.completionSnapshot()
+
+	reasoning := findPart(parts, partReasoning)
+	if reasoning == nil || !strings.Contains(reasoning.Content, "hmm") {
+		t.Fatalf("reasoning dropped: %#v", parts)
+	}
+	call := findPart(parts, partToolCall)
+	if call == nil || string(call.Arguments) != `{"q":"x"}` {
+		t.Fatalf("tool input not reassembled: %#v", call)
 	}
 }
 
 // Non-streaming responses carry tool_calls on the message, not in content.
-func TestNonStreamingToolCallsArePreserved(t *testing.T) {
+func TestNonStreamingToolCallsAreStructured(t *testing.T) {
 	body := `{"choices":[{"message":{"content":null,"tool_calls":[
       {"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\":\"hedgehogs\"}"}}
     ]}}]}`
-	got := extractCompletionText([]byte(body))
-	if !strings.Contains(got, "search") || !strings.Contains(got, "hedgehogs") {
-		t.Fatalf("non-streaming tool call dropped: %q", got)
+	parts := completionParts([]byte(body))
+	if len(parts) != 1 || parts[0].Type != partToolCall || parts[0].Name != "search" {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if !strings.Contains(string(parts[0].Arguments), "hedgehogs") {
+		t.Fatalf("arguments = %s", parts[0].Arguments)
 	}
 }
 
-func TestPlainTextStillClean(t *testing.T) {
-	msgs := parsePromptMessages([]byte(`{"messages":[{"role":"user","content":"just text"}]}`))
-	if len(msgs) != 1 || msgs[0].Content != "just text" {
+// The declared tool catalog must reach gen_ai.tool.definitions, which PostHog
+// maps to $ai_tools.
+func TestToolDefinitionsAreCaptured(t *testing.T) {
+	body := `{"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],
+	          "messages":[{"role":"user","content":"hi"}]}`
+	defs := toolDefinitions([]byte(body))
+	if len(defs) == 0 {
+		t.Fatal("tool definitions dropped")
+	}
+	if !strings.Contains(string(defs), "read_file") {
+		t.Fatalf("definitions = %s", defs)
+	}
+	// A request with no tools must not invent the attribute.
+	if got := toolDefinitions([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)); got != nil {
+		t.Fatalf("definitions emitted without tools: %s", got)
+	}
+}
+
+// The session id must be emitted under the name PostHog groups on, because a
+// custom key is stored but never grouped.
+func TestSessionIdUsesSemconvKey(t *testing.T) {
+	tr := &finishedTrace{
+		TraceID: "t", RequestID: "r", Outcome: "succeeded", SessionID: "claude:abc",
+		StartedAt: base, CompletedAt: base.Add(time.Second),
+		PromptJSON: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+		Attempts:   []usageRecord{{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second}},
+	}
+	spans := buildTraceSpans(tr, testConfig(), base)
+	for i, span := range spans {
+		if got := attrKeys(span.Attributes)["gen_ai.conversation.id"]; got != "claude:abc" {
+			t.Fatalf("span %d gen_ai.conversation.id = %q", i, got)
+		}
+	}
+}
+
+func TestPlainTextIsUnchanged(t *testing.T) {
+	msgs := promptMessages([]byte(`{"messages":[{"role":"user","content":"just text"}]}`))
+	if len(msgs) != 1 || len(msgs[0].Parts) != 1 {
 		t.Fatalf("plain text was mangled: %#v", msgs)
 	}
-	// A text part must not gain a [text] prefix.
-	parts := parsePromptMessages([]byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
-	if parts[0].Content != "hi" {
-		t.Fatalf("text part = %q, want it verbatim", parts[0].Content)
+	if msgs[0].Parts[0].Type != partText || msgs[0].Parts[0].Content != "just text" {
+		t.Fatalf("part = %#v", msgs[0].Parts[0])
+	}
+	// A text block keeps its text with no type prefix.
+	parts := promptMessages([]byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
+	if parts[0].Parts[0].Content != "hi" {
+		t.Fatalf("text part = %q, want it verbatim", parts[0].Parts[0].Content)
 	}
 }
 
@@ -442,7 +582,7 @@ func TestContentIsNotDuplicatedAcrossAttemptSpans(t *testing.T) {
 		TraceID: "t", RequestID: "r", Outcome: "succeeded",
 		StartedAt: base, CompletedAt: base.Add(time.Second),
 		PromptJSON: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
-		Completion: []byte("hi"),
+		Completion: []part{{Type: partText, Content: "hi"}},
 		Attempts: []usageRecord{
 			{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second, Failed: true},
 			{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second},
@@ -469,7 +609,7 @@ func TestContentFallsBackToRootWithoutAttempts(t *testing.T) {
 		TraceID: "t2", RequestID: "r2", Outcome: "succeeded",
 		StartedAt: base, CompletedAt: base.Add(time.Second),
 		PromptJSON: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
-		Completion: []byte("hi"),
+		Completion: []part{{Type: partText, Content: "hi"}},
 	}
 	spans := buildTraceSpans(tr, testConfig(), base)
 	if got := attrKeys(spans[0].Attributes)["gen_ai.input.messages"]; got == "" {
@@ -494,21 +634,23 @@ func TestLongPromptIsClippedFromTheFront(t *testing.T) {
 	}
 	body += `,{"role":"user","content":"THE-NEWEST-TURN"}]}`
 
-	msgs := trimPrompt(parsePromptMessages([]byte(body)), cfg)
+	msgs := trimPrompt(promptMessages([]byte(body)), cfg)
 	if len(msgs) == 0 {
 		t.Fatal("clipping dropped every message")
 	}
 	total := 0
 	for _, m := range msgs {
-		total += len(m.Content)
+		for _, p := range m.Parts {
+			total += len(p.Content)
+		}
 	}
 	if total > cfg.MaxTraceContentBytes+200 { // one message may exceed the cap alone
 		t.Fatalf("clipped prompt is %d bytes, budget %d", total, cfg.MaxTraceContentBytes)
 	}
-	if !strings.Contains(msgs[len(msgs)-1].Content, "THE-NEWEST-TURN") {
+	if !strings.Contains(messagesText(msgs[len(msgs)-1:]), "THE-NEWEST-TURN") {
 		t.Fatal("clipping dropped the newest turn instead of the oldest")
 	}
-	if !strings.Contains(msgs[0].Content, "earlier messages omitted") {
+	if !strings.Contains(messagesText(msgs[:1]), "earlier messages omitted") {
 		t.Fatal("clipping did not mark the removed prefix")
 	}
 }
@@ -516,9 +658,9 @@ func TestLongPromptIsClippedFromTheFront(t *testing.T) {
 func TestCompletionIsClipped(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxTraceContentBytes = 100
-	out := completionMessages(&finishedTrace{Completion: []byte(strings.Repeat("x", 500))}, cfg)
+	out := trimCompletion([]part{{Type: partText, Content: strings.Repeat("x", 500)}}, cfg)
 	if len(out) != 1 {
-		t.Fatalf("got %d messages", len(out))
+		t.Fatalf("got %d parts", len(out))
 	}
 	if len(out[0].Content) > 200 {
 		t.Fatalf("completion not clipped: %d bytes", len(out[0].Content))
@@ -709,11 +851,81 @@ func TestSingleOversizedMessageIsClipped(t *testing.T) {
 	cfg.MaxTraceContentBytes = 1000
 	cfg.MaxContentChars = 1 << 20
 
-	msgs := trimPrompt([]chatMessage{{Role: "user", Content: strings.Repeat("x", 50000)}}, cfg)
+	msgs := trimPrompt([]chatMessage{{Role: "user", Parts: []part{{Type: partText, Content: strings.Repeat("x", 50000)}}}}, cfg)
 	if len(msgs) != 1 {
 		t.Fatalf("got %d messages", len(msgs))
 	}
-	if len(msgs[0].Content) > 1000 {
-		t.Fatalf("single message kept %d bytes, cap is %d", len(msgs[0].Content), cfg.MaxTraceContentBytes)
+	if n := len(messagesText(msgs)); n > 1200 {
+		t.Fatalf("single message kept %d bytes, cap is %d", n, cfg.MaxTraceContentBytes)
+	}
+}
+
+// Anthropic announces a tool call's name and id in a content_block_start and
+// then streams the arguments with neither. Both halves must join into one named
+// call, or PostHog's extractor sees a nameless tool_call and skips it.
+func TestAnthropicStreamedToolCallIsNamed(t *testing.T) {
+	p := &pending{}
+	for _, chunk := range []string{
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}`,
+		`data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}`,
+		`data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"\"/etc/hosts\"}"}}`,
+	} {
+		p.appendDelta(extractDelta([]byte(chunk)), "stream")
+	}
+	parts := p.completionSnapshot()
+
+	if len(parts) != 1 {
+		t.Fatalf("got %d parts, want 1: %#v", len(parts), parts)
+	}
+	if parts[0].Name != "read_file" || parts[0].ID != "toolu_1" {
+		t.Fatalf("tool call was not named: %#v", parts[0])
+	}
+	if string(parts[0].Arguments) != `{"path":"/etc/hosts"}` {
+		t.Fatalf("arguments = %s", parts[0].Arguments)
+	}
+}
+
+// OpenAI interleaves parallel calls by index, so two calls must stay separate.
+func TestOpenAIParallelToolCallsStaySeparate(t *testing.T) {
+	p := &pending{}
+	for _, chunk := range []string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"read_file","arguments":""}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","function":{"name":"list_dir","arguments":""}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"p\":\"a\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"p\":\"b\"}"}}]}}]}`,
+	} {
+		p.appendDelta(extractDelta([]byte(chunk)), "stream")
+	}
+	parts := p.completionSnapshot()
+
+	if len(parts) != 2 {
+		t.Fatalf("got %d parts, want 2: %#v", len(parts), parts)
+	}
+	byName := map[string]string{}
+	for _, pt := range parts {
+		byName[pt.Name] = string(pt.Arguments)
+	}
+	if byName["read_file"] != `{"p":"a"}` || byName["list_dir"] != `{"p":"b"}` {
+		t.Fatalf("calls got crossed: %#v", byName)
+	}
+}
+
+// A real Claude stream announces text and thinking blocks too; those must not
+// be mistaken for tool calls.
+func TestAnthropicTextAndThinkingBlockStart(t *testing.T) {
+	p := &pending{}
+	for _, chunk := range []string{
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"x","input":{}}}`,
+	} {
+		p.appendDelta(extractDelta([]byte(chunk)), "stream")
+	}
+	parts := p.completionSnapshot()
+	if len(parts) != 2 {
+		t.Fatalf("got %d parts, want reasoning + tool call: %#v", len(parts), parts)
+	}
+	if parts[0].Type != partReasoning || parts[1].Type != partToolCall {
+		t.Fatalf("parts = %#v", parts)
 	}
 }

@@ -84,7 +84,7 @@ func BenchmarkBuildSpans(b *testing.B) {
 		TraceID: "t", RequestID: "r", Outcome: "succeeded",
 		StartedAt: base, CompletedAt: base.Add(time.Second),
 		PromptJSON: []byte(`{"messages":[{"role":"user","content":"` + string(make([]byte, 0)) + `hello"}]}`),
-		Completion: []byte("hi there"),
+		Completion: []part{{Type: partText, Content: "hi there"}},
 		Attempts:   []usageRecord{{Provider: "claude", Model: "m", RequestedAt: base, Latency: time.Second}},
 	}
 	cfg := testConfig()

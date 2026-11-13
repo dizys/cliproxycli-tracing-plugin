@@ -32,7 +32,7 @@ const (
 )
 
 // pluginVersion is overridden at build time with -X main.pluginVersion=<version>.
-var pluginVersion = "0.1.3"
+var pluginVersion = "0.2.0"
 
 var plugin = newPluginInstance()
 
@@ -204,11 +204,11 @@ func handleStreamChunk(req []byte) ([]byte, error) {
 		return okEnvelope(streamChunkResponse{})
 	}
 
-	text := extractDeltaText(r.Body)
-	if len(text) == 0 {
+	delta := extractDelta(r.Body)
+	if delta.empty() {
 		return okEnvelope(streamChunkResponse{})
 	}
-	plugin.store.appendTo(key, now, text, "stream")
+	plugin.store.appendTo(key, now, delta, "stream")
 	return okEnvelope(streamChunkResponse{})
 }
 
@@ -239,8 +239,8 @@ func handleResponseIntercept(req []byte) ([]byte, error) {
 		if len(p.promptJSON) == 0 {
 			p.setPrompt(r.RequestBody, "response_body")
 		}
-		if text := extractCompletionText(r.Body); len(text) > 0 {
-			p.appendCompletion([]byte(text), "response")
+		if parts := completionParts(r.Body); len(parts) > 0 {
+			p.setCompletionParts(parts, "response")
 		}
 	})
 	return okEnvelope(responseInterceptResponse{})
